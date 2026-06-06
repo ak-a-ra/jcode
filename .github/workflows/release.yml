@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: false
+        default: 'aarch64-unknown-linux-gnu'
 
 concurrency:
   group: release-${{ github.ref }}
@@ -61,18 +67,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
-          submodules: recursive
           fetch-depth: 0
-
-      - name: Configure SSH for cargo git dependencies
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_KEY }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install nightly for emulated TLS (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-unknown-linux-gnu
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.7
@@ -100,6 +105,9 @@ jobs:
           [target.x86_64-unknown-linux-gnu]
           linker = "clang"
           rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+          [target.aarch64-unknown-linux-gnu]
+          linker = "clang"
+          rustflags = ["-C", "link-arg=-fuse-ld=mold", "-Z", "tls-model=emulated"]
           EOF
           fi
           if command -v sccache &>/dev/null && sccache --start-server 2>/dev/null; then
