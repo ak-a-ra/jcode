@@ -2954,20 +2954,19 @@ impl App {
             // in the background (not synchronously on the event loop, which would
             // freeze the TUI on slower filesystems like Termux Android).
             if skill.is_none() {
-                if let Some(wd) = self.session.working_dir.clone() {
-                    spawn_blocking_or_thread(move || {
-                        if let Ok(mut registry) = SkillRegistry::shared_registry().try_write() {
-                            let _ = registry
-                                .reload_all_for_working_dir(Some(std::path::Path::new(&wd)));
+                let skills_registry = self.registry.skills();
+                let skill_name_owned = skill_name.to_string();
+                let working_dir = self.session.working_dir.clone();
+                spawn_blocking_or_thread(move || {
+                    let wd = working_dir.as_deref().map(std::path::Path::new);
+                    if let Ok(reloaded) = SkillRegistry::load_for_working_dir(wd) {
+                        if reloaded.contains(&skill_name_owned) {
+                            if let Ok(mut skills) = skills_registry.try_write() {
+                                *skills = reloaded;
+                            }
                         }
-                    });
-                } else {
-                    spawn_blocking_or_thread(move || {
-                        if let Ok(mut registry) = SkillRegistry::shared_registry().try_write() {
-                            let _ = registry.reload_all();
-                        }
-                    });
-                }
+                    }
+                });
             }
 
             if let Some(skill) = skill {
@@ -2982,8 +2981,12 @@ impl App {
                 });
             } else {
                 self.push_display_message(DisplayMessage {
-                    role: "error".to_string(),
-                    content: format!("Unknown skill: /{}", skill_name),
+                    role: "info".to_string(),
+                    content: format!(
+                        "Skill /{} not found in cache. Loading skills in the background — \
+                         type /{} again to use it.",
+                        skill_name, skill_name
+                    ),
                     tool_calls: vec![],
                     duration_secs: None,
                     title: None,
