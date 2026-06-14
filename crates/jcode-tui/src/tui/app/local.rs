@@ -34,7 +34,14 @@ pub(super) async fn process_turn_with_input(
         }
         Err(error) => {
             let err_str = crate::util::format_error_chain(&error);
-            if is_context_limit_error(&err_str) {
+            if super::is_request_payload_too_large_error(&err_str) {
+                if !app
+                    .try_recover_payload_too_large_and_retry(terminal, event_stream)
+                    .await
+                {
+                    app.handle_turn_error(err_str);
+                }
+            } else if is_context_limit_error(&err_str) {
                 if !app.try_auto_compact_and_retry(terminal, event_stream).await {
                     app.handle_turn_error(err_str);
                 }
@@ -60,13 +67,18 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
     app.progress_mouse_scroll_animation();
     needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
+    // Dissolve stale (off-screen) reasoning traces with zero visible motion.
+    needs_redraw |= app.gc_offscreen_reasoning_traces();
+    // Adopt the resolved scroll position once a frame containing newly loaded
+    // older history has rendered, so manual scrolling resumes seamlessly.
+    needs_redraw |= app.reconcile_history_anchor();
     if app.submit_input_on_startup && !app.is_processing {
         app.submit_input_on_startup = false;
         app.submit_input();
         needs_redraw = true;
     }
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
+    let ops = app.stream_buffer.flush();
+    if app.apply_stream_ops(ops) {
         needs_redraw = true;
     }
     needs_redraw |= app.refresh_todos_view_if_needed();
@@ -346,7 +358,12 @@ fn apply_terminal_event(
 ) -> Result<bool> {
     match event {
         Some(Ok(Event::FocusGained)) => {
+            let redraw = app.set_client_focused(true);
             app.note_client_focus(true);
+            Ok(redraw)
+        }
+        Some(Ok(Event::FocusLost)) => {
+            app.set_client_focused(false);
             Ok(false)
         }
         Some(Ok(Event::Key(key))) => {
@@ -459,8 +476,8 @@ fn handle_input_shell_completed(app: &mut App, shell: InputShellCompleted) {
 }
 
 pub(super) fn finish_turn(app: &mut App) {
-    app.total_input_tokens += app.streaming_input_tokens;
-    app.total_output_tokens += app.streaming_output_tokens;
+    app.token_accounting.total_input_tokens += app.streaming.streaming_input_tokens;
+    app.token_accounting.total_output_tokens += app.streaming.streaming_output_tokens;
     app.update_cost_impl();
     app.is_processing = false;
     app.status = ProcessingStatus::Idle;

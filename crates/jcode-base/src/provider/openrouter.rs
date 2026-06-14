@@ -10,21 +10,17 @@
 //! - Manual pinning: Set JCODE_OPENROUTER_PROVIDER or use model@Provider syntax
 
 use super::{EventStream, Provider};
-use crate::message::{
-    CacheControl, ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT,
-    ToolDefinition,
-};
+use crate::message::{CacheControl, ContentBlock, Message, Role, StreamEvent, ToolDefinition};
 use crate::provider_catalog::{
     OPENAI_COMPAT_PROFILE, is_safe_env_file_name, is_safe_env_key_name,
-    load_api_key_from_env_or_config, normalize_api_base, openai_compatible_profile_by_id,
-    openai_compatible_profile_id_for_api_base, openai_compatible_profile_static_context_limits,
-    openai_compatible_profile_static_models, openai_compatible_profiles,
-    resolve_openai_compatible_profile,
+    load_api_key_from_env_or_config, load_env_value_from_env_or_config, normalize_api_base,
+    openai_compatible_profile_by_id, openai_compatible_profile_id_for_api_base,
+    openai_compatible_profile_static_context_limits, openai_compatible_profile_static_models,
+    openai_compatible_profiles, resolve_openai_compatible_profile,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 pub use jcode_provider_openrouter::{
     EndpointInfo, ModelInfo, ModelPricing, ModelTimestampIndex, ProviderRouting,
     all_model_timestamps, load_endpoints_disk_cache_public, load_model_pricing_disk_cache_public,
@@ -40,11 +36,8 @@ use reqwest::Client;
 use reqwest::header::HeaderName;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::pin::Pin;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context as TaskContext, Poll};
-use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -713,6 +706,16 @@ fn global_profile_catalog_refresh() -> &'static Mutex<ProfileCatalogRefreshTrack
         .get_or_init(|| Mutex::new(ProfileCatalogRefreshTracker::default()))
 }
 
+/// Clear the process-global profile catalog refresh tracker. Tests that
+/// assert a refresh fires must not inherit `last_attempt_unix` backoff (or an
+/// in-flight marker) recorded by other tests in the same process.
+#[cfg(test)]
+pub(crate) fn reset_profile_catalog_refresh_tracker_for_tests() {
+    if let Ok(mut state) = global_profile_catalog_refresh().lock() {
+        *state = ProfileCatalogRefreshTracker::default();
+    }
+}
+
 fn begin_profile_catalog_refresh(profile_id: &str) -> bool {
     let Some(now) = current_unix_secs() else {
         return false;
@@ -934,7 +937,15 @@ pub struct OpenRouterProvider {
     supports_provider_features: bool,
     supports_model_catalog: bool,
     profile_id: Option<String>,
+    /// Explicit `supports_reasoning_effort` override from named-profile config.
+    /// `None` means auto-detect (deepseek profile id or DeepSeek-family model).
+    reasoning_effort_support: Option<bool>,
     max_tokens: Option<u32>,
+    /// Extra top-level JSON object fields merged into every chat/completions
+    /// request body (e.g. NVIDIA NIM DeepSeek-V4 `chat_template_kwargs`).
+    /// Resolved once at construction from named-profile config or the
+    /// `JCODE_OPENAI_EXTRA_BODY` env/env-file value.
+    extra_body: Option<serde_json::Map<String, Value>>,
     static_models: Vec<String>,
     static_context_limits: HashMap<String, usize>,
     send_openrouter_headers: bool,
@@ -955,6 +966,73 @@ impl OpenRouterProvider {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
     }
 
+    /// DeepSeek-family models accept the DeepSeek-style top-level
+    /// `reasoning_effort` request field regardless of which OpenAI-compatible
+    /// gateway serves them (issue #352: profiles like opencode-go serve
+    /// DeepSeek V4 but were rejected by the profile-id-only check).
+    fn model_is_deepseek_family(model: &str) -> bool {
+        model.trim().to_ascii_lowercase().contains("deepseek")
+    }
+
+    /// Does this runtime accept the DeepSeek-style `reasoning_effort` field?
+    /// Priority: explicit named-profile config override, then the dedicated
+    /// deepseek profile, then the active model family for direct compat
+    /// endpoints (never for real OpenRouter, which uses unified reasoning).
+    pub(crate) fn supports_deepseek_reasoning_effort(&self) -> bool {
+        if let Some(explicit) = self.reasoning_effort_support {
+            return explicit;
+        }
+        if Self::profile_supports_reasoning_effort(self.profile_id.as_deref()) {
+            return true;
+        }
+        !Self::profile_supports_unified_reasoning(
+            self.profile_id.as_deref(),
+            self.send_openrouter_headers,
+        ) && Self::model_is_deepseek_family(&self.model_snapshot())
+    }
+
+    fn model_snapshot(&self) -> String {
+        self.model
+            .try_read()
+            .map(|model| model.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
+        self.supports_deepseek_reasoning_effort()
+            || Self::profile_supports_unified_reasoning(
+                self.profile_id.as_deref(),
+                self.send_openrouter_headers,
+            )
+    }
+
+    pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
+        if self.supports_deepseek_reasoning_effort() {
+            Self::normalize_reasoning_effort(effort)
+        } else {
+            Self::normalize_unified_reasoning_effort(effort)
+        }
+    }
+
+    /// Initial reasoning effort at construction. Named/compat profiles that
+    /// support effort honor the user's configured `openai_reasoning_effort`
+    /// (issue #352: previously hardcoded to None so the config was ignored).
+    fn initial_reasoning_effort(
+        reasoning_effort_support: Option<bool>,
+        profile_id: Option<&str>,
+    ) -> Option<String> {
+        let supported =
+            reasoning_effort_support.unwrap_or(Self::profile_supports_reasoning_effort(profile_id));
+        if !supported {
+            return None;
+        }
+        crate::config::config()
+            .provider
+            .openai_reasoning_effort
+            .as_deref()
+            .and_then(Self::normalize_reasoning_effort)
+    }
+
     fn profile_rejects_image_input(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
     }
@@ -964,14 +1042,6 @@ impl OpenRouterProvider {
         send_openrouter_headers: bool,
     ) -> bool {
         profile_id.is_none() && send_openrouter_headers
-    }
-
-    fn supports_reasoning_effort_for_profile(
-        profile_id: Option<&str>,
-        send_openrouter_headers: bool,
-    ) -> bool {
-        Self::profile_supports_reasoning_effort(profile_id)
-            || Self::profile_supports_unified_reasoning(profile_id, send_openrouter_headers)
     }
 
     fn normalize_reasoning_effort(raw: &str) -> Option<String> {
@@ -1011,17 +1081,6 @@ impl OpenRouterProvider {
         }
     }
 
-    fn normalize_reasoning_effort_for_profile(
-        profile_id: Option<&str>,
-        effort: &str,
-    ) -> Option<String> {
-        if Self::profile_supports_reasoning_effort(profile_id) {
-            Self::normalize_reasoning_effort(effort)
-        } else {
-            Self::normalize_unified_reasoning_effort(effort)
-        }
-    }
-
     fn configured_max_tokens(profile_id: Option<&str>) -> Option<u32> {
         if let Ok(raw) = std::env::var("JCODE_OPENROUTER_MAX_TOKENS") {
             let trimmed = raw.trim();
@@ -1042,8 +1101,104 @@ impl OpenRouterProvider {
         None
     }
 
+    /// Resolve extra request-body fields for an OpenAI-compatible/OpenRouter
+    /// provider.
+    ///
+    /// Sources, in precedence order (later overrides earlier):
+    /// 1. An optional named-profile `extra_body` config object.
+    /// 2. The `JCODE_OPENAI_EXTRA_BODY` env var (or the same key inside the
+    ///    profile's `.env` file), parsed as a JSON object string.
+    ///
+    /// This lets users inject non-standard parameters that some backends
+    /// require, e.g. NVIDIA NIM DeepSeek-V4 reasoning models need
+    /// `chat_template_kwargs = { "thinking": true, "reasoning_effort": "high" }`
+    /// or they silently hang instead of responding (issue #341).
+    ///
+    /// Returns `None` when nothing is configured. Invalid input is logged and
+    /// ignored rather than failing provider construction.
+    fn resolve_extra_body(
+        config: Option<&serde_json::Value>,
+        env_file: &str,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let mut merged = serde_json::Map::new();
+
+        if let Some(value) = config {
+            match value.as_object() {
+                Some(object) => {
+                    for (key, val) in object {
+                        merged.insert(key.clone(), val.clone());
+                    }
+                }
+                None => crate::logging::warn(
+                    "Ignoring provider `extra_body`: expected a table/object of top-level request fields",
+                ),
+            }
+        }
+
+        if let Some(raw) = load_env_value_from_env_or_config("JCODE_OPENAI_EXTRA_BODY", env_file) {
+            match serde_json::from_str::<Value>(&raw) {
+                Ok(Value::Object(object)) => {
+                    for (key, val) in object {
+                        merged.insert(key, val);
+                    }
+                }
+                Ok(_) => crate::logging::warn(
+                    "Ignoring JCODE_OPENAI_EXTRA_BODY: expected a JSON object string, e.g. {\"chat_template_kwargs\":{\"thinking\":true}}",
+                ),
+                Err(err) => crate::logging::warn(&format!(
+                    "Ignoring invalid JCODE_OPENAI_EXTRA_BODY JSON: {err}"
+                )),
+            }
+        }
+
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
+    }
+
     pub(crate) fn supports_provider_routing_features(&self) -> bool {
         self.supports_provider_features
+    }
+
+    /// Human-facing label for the runtime backing this provider instance.
+    ///
+    /// Unlike the env-var based [`crate::provider_catalog::runtime_provider_display_name`],
+    /// this reads the instance's own `profile_id`/`api_base`, so it stays correct
+    /// after a runtime `/model` switch to a different OpenAI-compatible profile
+    /// (e.g. NVIDIA NIM) even though `name()` is fixed at `"openrouter"`.
+    pub(crate) fn runtime_display_name(&self) -> String {
+        // Direct OpenAI-compatible profile (NVIDIA NIM, DeepSeek, Z.AI, ...).
+        if let Some(profile_id) = self.profile_id.as_deref() {
+            if let Some(profile) = openai_compatible_profile_by_id(profile_id) {
+                return profile.display_name.to_string();
+            }
+            return profile_id.to_string();
+        }
+
+        // Non-aggregator endpoint without a known profile id: classify by base
+        // URL so custom OpenAI-compatible endpoints don't masquerade as the
+        // public OpenRouter aggregator.
+        if !self.supports_provider_features {
+            if let Some(profile_id) =
+                crate::provider_catalog::openai_compatible_profile_id_for_api_base(&self.api_base)
+                && let Some(profile) = openai_compatible_profile_by_id(profile_id)
+            {
+                return profile.display_name.to_string();
+            }
+            if std::env::var("JCODE_RUNTIME_PROVIDER")
+                .ok()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("azure-openai"))
+            {
+                return "Azure OpenAI".to_string();
+            }
+            if !self.api_base.contains("openrouter.ai") {
+                return "OpenAI-compatible".to_string();
+            }
+        }
+
+        "OpenRouter".to_string()
     }
 
     pub(crate) fn direct_openai_compatible_route_parts(&self) -> Option<(String, String, String)> {
@@ -1140,7 +1295,10 @@ impl OpenRouterProvider {
         Ok(Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(None)),
+            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
+                profile.supports_reasoning_effort,
+                Some(profile_name),
+            ))),
             api_base,
             auth,
             supports_provider_features: matches!(
@@ -1154,7 +1312,16 @@ impl OpenRouterProvider {
                     crate::config::NamedProviderType::OpenRouter
                 ),
             profile_id: Some(profile_name.to_string()),
+            reasoning_effort_support: profile.supports_reasoning_effort,
             max_tokens: Self::configured_max_tokens(Some(profile_name)),
+            extra_body: Self::resolve_extra_body(
+                profile.extra_body.as_ref(),
+                profile
+                    .env_file
+                    .as_deref()
+                    .filter(|name| is_safe_env_file_name(name))
+                    .unwrap_or(DEFAULT_ENV_FILE),
+            ),
             static_models,
             static_context_limits,
             send_openrouter_headers: false,
@@ -1285,17 +1452,23 @@ impl OpenRouterProvider {
             ProviderRouting::default()
         };
         let max_tokens = Self::configured_max_tokens(profile_id.as_deref());
+        let extra_body = Self::resolve_extra_body(None, &configured_env_file_name());
 
         Ok(Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(None)),
+            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
+                None,
+                profile_id.as_deref(),
+            ))),
             api_base,
             auth,
             supports_provider_features,
             supports_model_catalog,
             profile_id,
+            reasoning_effort_support: None,
             max_tokens,
+            extra_body,
             static_models,
             static_context_limits,
             send_openrouter_headers,
@@ -1333,7 +1506,9 @@ impl OpenRouterProvider {
             supports_provider_features: true,
             supports_model_catalog: true,
             profile_id: None,
+            reasoning_effort_support: None,
             max_tokens: Self::configured_max_tokens(None),
+            extra_body: Self::resolve_extra_body(None, DEFAULT_ENV_FILE),
             static_models: Vec::new(),
             static_context_limits: HashMap::new(),
             send_openrouter_headers: true,
@@ -1390,13 +1565,18 @@ impl OpenRouterProvider {
         Ok(Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
-            reasoning_effort: Arc::new(RwLock::new(None)),
+            reasoning_effort: Arc::new(RwLock::new(Self::initial_reasoning_effort(
+                None,
+                Some(&resolved.id),
+            ))),
             api_base,
             auth,
             supports_provider_features: false,
             supports_model_catalog: true,
             profile_id: Some(resolved.id.clone()),
+            reasoning_effort_support: None,
             max_tokens: Self::configured_max_tokens(Some(&resolved.id)),
+            extra_body: Self::resolve_extra_body(None, &resolved.env_file),
             static_models,
             static_context_limits,
             send_openrouter_headers: false,
@@ -1617,7 +1797,9 @@ impl OpenRouterProvider {
                 supports_provider_features: true,
                 supports_model_catalog: true,
                 profile_id: None,
+                reasoning_effort_support: None,
                 max_tokens: None,
+                extra_body: None,
                 static_models: Vec::new(),
                 static_context_limits: HashMap::new(),
                 send_openrouter_headers: true,
@@ -2400,5 +2582,6 @@ mod openrouter_provider_impl;
 mod openrouter_sse_stream;
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 #[path = "openrouter_tests.rs"]
 mod tests;

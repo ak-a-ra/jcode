@@ -80,9 +80,16 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
     app.progress_mouse_scroll_animation();
     needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
+    // Dissolve stale (off-screen) reasoning traces with zero visible motion.
+    needs_redraw |= app.gc_offscreen_reasoning_traces();
     needs_redraw |= dispatch_compacted_history_load(app, remote).await;
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
+    // Adopt the resolved scroll position once a frame containing newly loaded
+    // older history has rendered, so manual scrolling resumes seamlessly.
+    needs_redraw |= app.reconcile_history_anchor();
+    // Reveal buffered streaming text at the smooth paced rate on each tick, the
+    // same as the local turn loop. Finalization paths still call flush().
+    let ops = app.stream_buffer.flush_smooth_frame();
+    if app.apply_stream_ops(ops) {
         needs_redraw = true;
     }
 
@@ -121,7 +128,7 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
             }
         }
 
-        if let Some(target_session) = crate::tui::workspace_client::take_pending_resume_session() {
+        if let Some(target_session) = app.workspace_client.take_pending_resume_session() {
             match remote.resume_session(&target_session).await {
                 Ok(()) => {
                     let label = crate::id::extract_session_name(&target_session)
@@ -271,7 +278,12 @@ pub(super) async fn handle_terminal_event(
     match event {
         Some(Ok(Event::FocusGained)) => {
             input_attribution.event = Some("focus_gained".to_string());
+            needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
+        }
+        Some(Ok(Event::FocusLost)) => {
+            input_attribution.event = Some("focus_lost".to_string());
+            app.set_client_focused(false);
         }
         Some(Ok(Event::Key(key))) => {
             input_attribution.event = Some(format!("key:{:?}:{:?}", key.code, key.kind));
@@ -607,7 +619,11 @@ fn handle_terminal_event_while_disconnected(
 
     match event {
         Some(Ok(Event::FocusGained)) => {
+            needs_redraw |= app.set_client_focused(true);
             app.note_client_focus(true);
+        }
+        Some(Ok(Event::FocusLost)) => {
+            app.set_client_focused(false);
         }
         Some(Ok(Event::Key(key))) => {
             app.note_client_interaction();
@@ -731,21 +747,20 @@ pub(super) fn handle_disconnect(
     app.current_message_id = None;
     app.last_stream_activity = None;
     app.remote_resume_activity = None;
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
-    }
-    if !app.streaming_text.is_empty() {
+    let ops = app.stream_buffer.flush();
+    app.apply_stream_ops(ops);
+    if !app.streaming.streaming_text.is_empty() {
         let content = app.take_streaming_text();
         let content = app.collapse_reasoning_for_commit(content);
         if !content.trim().is_empty() {
-        app.push_display_message(DisplayMessage {
-            role: "assistant".to_string(),
-            content,
-            tool_calls: vec![],
-            duration_secs: None,
-            title: None,
-            tool_data: None,
-        });
+            app.push_display_message(DisplayMessage {
+                role: "assistant".to_string(),
+                content,
+                tool_calls: vec![],
+                duration_secs: None,
+                title: None,
+                tool_data: None,
+            });
         }
     }
     app.clear_streaming_render_state();
@@ -1247,18 +1262,18 @@ async fn detect_and_cancel_stall(app: &mut App, remote: &mut RemoteConnection) {
             app.current_message_id = None;
             app.processing_started = None;
             app.last_stream_activity = None;
-            if !app.streaming_text.is_empty() {
+            if !app.streaming.streaming_text.is_empty() {
                 let content = app.take_streaming_text();
                 let content = app.collapse_reasoning_for_commit(content);
                 if !content.trim().is_empty() {
-                app.push_display_message(DisplayMessage {
-                    role: "assistant".to_string(),
-                    content,
-                    tool_calls: vec![],
-                    duration_secs: None,
-                    title: None,
-                    tool_data: None,
-                });
+                    app.push_display_message(DisplayMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_calls: vec![],
+                        duration_secs: None,
+                        title: None,
+                        tool_data: None,
+                    });
                 }
             }
             if !app.schedule_pending_remote_retry(
@@ -1375,6 +1390,7 @@ async fn parse_and_inject_key(
 
 fn handle_disconnected_local_command(app: &mut App, trimmed: &str) -> bool {
     let handled = super::commands::handle_help_command(app, trimmed)
+        || super::commands::handle_keys_command(app, trimmed)
         || super::commands::handle_session_command(app, trimmed)
         || super::commands::handle_test_command(app, trimmed)
         || super::commands::handle_disabled_mission_command(app, trimmed)

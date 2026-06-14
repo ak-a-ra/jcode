@@ -302,19 +302,19 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             app.thinking_buffer.clear();
             app.streaming_tool_calls.clear();
             app.batch_progress = None;
-            app.streaming_input_tokens = 0;
-            app.streaming_output_tokens = 0;
-            app.streaming_cache_read_tokens = None;
-            app.streaming_cache_creation_tokens = None;
-            app.current_api_usage_recorded = false;
+            app.streaming.streaming_input_tokens = 0;
+            app.streaming.streaming_output_tokens = 0;
+            app.streaming.streaming_cache_read_tokens = None;
+            app.streaming.streaming_cache_creation_tokens = None;
+            app.kv_cache.current_api_usage_recorded = false;
             app.upstream_provider = None;
             app.status_detail = None;
-            app.streaming_tps_start = None;
-            app.streaming_tps_elapsed = std::time::Duration::ZERO;
-            app.streaming_tps_collect_output = false;
-            app.streaming_total_output_tokens = 0;
-            app.streaming_tps_observed_output_tokens = 0;
-            app.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_start = None;
+            app.streaming.streaming_tps_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_collect_output = false;
+            app.streaming.streaming_total_output_tokens = 0;
+            app.streaming.streaming_tps_observed_output_tokens = 0;
+            app.streaming.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
             app.processing_started = Some(Instant::now());
             app.visible_turn_started = Some(Instant::now());
             app.pending_turn = true;
@@ -643,7 +643,9 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             "session_id": spec.session_id,
             "command": "/subagent",
         }),
-        intent: None, thought_signature: None, };
+        intent: None,
+        thought_signature: None,
+    };
 
     app.push_display_message(DisplayMessage {
         role: "tool".to_string(),
@@ -657,7 +659,9 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
     let content_blocks = vec![ContentBlock::ToolUse {
         id: tool_call.id.clone(),
         name: tool_call.name.clone(),
-        input: tool_call.input.clone(), thought_signature: None, }];
+        input: tool_call.input.clone(),
+        thought_signature: None,
+    }];
     app.add_provider_message(Message {
         role: Role::Assistant,
         content: content_blocks.clone(),
@@ -837,6 +841,38 @@ pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     false
 }
 
+/// `/keys` shows the keymap diagnostics: detected terminal, discovered terminal
+/// and macOS shortcuts, and any conflicts with jcode's own keybindings.
+/// `/keys refresh` forces a fresh scan of the machine (otherwise a cached
+/// snapshot up to a day old is reused).
+pub(super) fn handle_keys_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/keys")
+        .or_else(|| slash_command_rest(trimmed, "/keybindings"))
+    else {
+        return false;
+    };
+
+    let force_refresh = matches!(rest.trim(), "refresh" | "rescan" | "reload");
+    let snapshot = if force_refresh {
+        crate::setup_hints::keymap::refresh_and_save()
+    } else {
+        crate::setup_hints::keymap::snapshot_cached_or_refresh()
+    };
+
+    let cfg = crate::config::config();
+    let report = crate::setup_hints::keymap::render_report(&cfg.keybindings, &snapshot);
+    app.push_display_message(DisplayMessage::system(report));
+
+    if let Some(status) =
+        crate::setup_hints::keymap::render_status_line(&cfg.keybindings, &snapshot)
+    {
+        app.set_status_notice(status);
+    } else {
+        app.set_status_notice("No keybinding conflicts detected");
+    }
+    true
+}
+
 pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool {
     let Some(rest) = slash_command_rest(trimmed, "/provider-test-coverage")
         .or_else(|| slash_command_rest(trimmed, "/model-status"))
@@ -888,7 +924,7 @@ fn apply_diff_mode(app: &mut App, mode: crate::config::DiffDisplayMode) {
     if !app.diff_pane_visible() {
         app.diff_pane_focus = false;
     }
-    app.set_status_notice(&format!("Diffs: {}", app.diff_mode.label()));
+    app.set_status_notice(format!("Diffs: {}", app.diff_mode.label()));
 }
 
 pub(super) fn handle_diff_command(app: &mut App, trimmed: &str) -> bool {
@@ -1567,7 +1603,7 @@ fn handle_transcript_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    match open::that_detached(&path) {
+    match super::helpers::open_path_or_url_detached(&path) {
         Ok(()) => {
             app.push_display_message(DisplayMessage::system(transcript_opened_message(&path)));
             app.set_status_notice("Transcript opened");
@@ -1619,6 +1655,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if trimmed == "/commit" {
         handle_commit_command_local(app);
+        return true;
+    }
+
+    if trimmed == "/commit-push" || trimmed == "/commit-and-push" {
+        handle_commit_push_command_local(app);
         return true;
     }
 
@@ -2025,11 +2066,28 @@ pub(super) fn build_commit_prompt() -> String {
     "Make interactive, logical commits for the current uncommitted work. Inspect the git state first, including unstaged and staged changes. Group related changes into small coherent commits, staging only the files or hunks that belong together. Preserve unrelated user or agent work, do not discard changes, and do not amend existing commits unless clearly necessary. For each commit, use a concise conventional-style message when possible. Validate as appropriate for the changed files before committing, and report the commits created plus any remaining uncommitted changes.".to_string()
 }
 
+pub(super) fn build_commit_push_prompt() -> String {
+    let mut prompt = build_commit_prompt();
+    prompt.push(' ');
+    prompt.push_str(
+        "After creating the commits, push them to the remote tracking branch with git push (set the upstream with git push -u if the branch has no upstream yet). If the push fails, report the error instead of force-pushing, and never force-push or rewrite already-pushed history. Finally, report the commits created and the push result.",
+    );
+    prompt
+}
+
 pub(super) fn commit_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits...".to_string()
     } else {
         "🚀 Starting logical commits...".to_string()
+    }
+}
+
+pub(super) fn commit_push_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push...".to_string()
+    } else {
+        "🚀 Starting logical commits + push...".to_string()
     }
 }
 
@@ -2044,6 +2102,21 @@ fn handle_commit_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(commit_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_commit_push_command_local(app: &mut App) {
+    let prompt = build_commit_push_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /commit-push...",
+            commit_push_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(commit_push_launch_notice(false)));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
     }
 }

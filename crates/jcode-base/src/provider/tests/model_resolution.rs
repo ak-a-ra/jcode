@@ -146,19 +146,29 @@ fn test_cerebras_model_routes_are_profile_scoped_and_unique() {
             };
 
             let routes = provider.model_routes();
-            let qwen_routes = routes
+            // Assert against the profile's current static model list so this
+            // test tracks catalog updates instead of hardcoding a model that
+            // Cerebras may stop serving (the original fixture pinned
+            // `qwen-3-235b-a22b-instruct-2507`, which rotted when the static
+            // coverage was refreshed).
+            let static_models = crate::provider_catalog::openai_compatible_profile_static_models(
+                crate::provider_catalog::CEREBRAS_PROFILE,
+            );
+            let probe_model = static_models
+                .first()
+                .expect("Cerebras profile should have static models")
+                .clone();
+            let probe_routes = routes
                 .iter()
-                .filter(|route| {
-                    route.provider == "Cerebras" && route.model == "qwen-3-235b-a22b-instruct-2507"
-                })
+                .filter(|route| route.provider == "Cerebras" && route.model == probe_model)
                 .collect::<Vec<_>>();
             assert_eq!(
-                qwen_routes.len(),
+                probe_routes.len(),
                 1,
                 "Cerebras direct route should not appear twice in provider routes: {routes:?}"
             );
-            assert_eq!(qwen_routes[0].api_method, "openai-compatible:cerebras");
-            assert!(qwen_routes[0].available);
+            assert_eq!(probe_routes[0].api_method, "openai-compatible:cerebras");
+            assert!(probe_routes[0].available);
             assert!(
                 !routes.iter().any(|route| {
                     route.provider == "Cerebras" && route.api_method == "openai-compatible"
@@ -524,10 +534,10 @@ fn test_session_route_restore_request_matrix_preserves_runtime_identity() {
             "copilot:claude-sonnet-4",
         ),
         (
-            "composer-1.5",
+            "composer-2.5",
             Some("cursor"),
             Some("cursor"),
-            "cursor:composer-1.5",
+            "cursor:composer-2.5",
         ),
         (
             "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -947,20 +957,17 @@ fn test_profile_prefixed_model_switch_reinitializes_direct_compatible_runtime() 
                     .expect("DeepSeek profile-prefixed model should initialize direct provider");
                 assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
                 assert_eq!(provider.model(), "deepseek-v4-pro");
-                assert_eq!(
-                    crate::provider_catalog::runtime_provider_display_name(provider.name()),
-                    "DeepSeek"
-                );
+                // `display_name` resolves through the active execution runtime
+                // (registry), which is the production display path since the
+                // compat-profile/OpenRouter slot split.
+                assert_eq!(provider.display_name(), "DeepSeek");
 
                 provider
                     .set_model("kimi:kimi-for-coding")
                     .expect("Kimi profile-prefixed model should reinitialize direct provider");
                 assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
                 assert_eq!(provider.model(), "kimi-for-coding");
-                assert_eq!(
-                    crate::provider_catalog::runtime_provider_display_name(provider.name()),
-                    "Kimi Code"
-                );
+                assert_eq!(provider.display_name(), "Kimi Code");
             })
         })
     });
@@ -1073,8 +1080,10 @@ fn test_anthropic_auth_mode_prefixed_model_switch_changes_credentials() {
         assert_eq!(
             rt.block_on(anthropic.test_access_token_and_oauth_mode())
                 .expect("default token"),
-            ("sk-ant-test-api-key".to_string(), false),
-            "default Anthropic credentials should keep existing API-key-first behavior"
+            ("oauth-access-token".to_string(), true),
+            "default (Auto) Anthropic credentials prefer OAuth/subscription when an \
+             OAuth account is available, matching the canonical OAuth-first Auto \
+             behavior shared with the OpenAI provider and resolve_dual_credential_auth"
         );
 
         provider
@@ -1095,6 +1104,86 @@ fn test_anthropic_auth_mode_prefixed_model_switch_changes_credentials() {
             ("sk-ant-test-api-key".to_string(), false)
         );
     });
+}
+
+#[test]
+fn test_config_default_provider_anthropic_api_pins_api_credential() {
+    use jcode_provider_core::{Provider, ResolvedCredential};
+    // A config `default_provider = "anthropic-api"` is a routing decision that
+    // also pins the OAuth-vs-API credential. Applying the default at startup
+    // must leave the provider on the API-key route so the header auth tag and
+    // model picker report "API Key", not the Auto/OAuth fallback.
+    for (default_provider, expected, expect_oauth) in [
+        ("anthropic-api", ResolvedCredential::ApiKey, false),
+        ("claude-api", ResolvedCredential::ApiKey, false),
+        ("claude", ResolvedCredential::Oauth, true),
+        ("anthropic", ResolvedCredential::Oauth, true),
+    ] {
+        with_clean_provider_test_env(|| {
+            crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-api-key");
+            crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+                label: "claude-1".to_string(),
+                access: "oauth-access-token".to_string(),
+                refresh: "oauth-refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                email: None,
+                subscription_type: Some("max".to_string()),
+                scopes: vec!["user:inference".to_string()],
+            })
+            .expect("save Claude OAuth account");
+
+            let anthropic = Arc::new(anthropic::AnthropicProvider::new());
+            let provider = MultiProvider {
+                claude: RwLock::new(None),
+                anthropic: RwLock::new(Some(Arc::clone(&anthropic))),
+                openai: RwLock::new(None),
+                copilot_api: RwLock::new(None),
+                antigravity: RwLock::new(None),
+                gemini: RwLock::new(None),
+                cursor: RwLock::new(None),
+                bedrock: RwLock::new(None),
+                openrouter: RwLock::new(None),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
+                active: RwLock::new(ActiveProvider::Claude),
+                use_claude_cli: false,
+                startup_notices: RwLock::new(Vec::new()),
+                forced_provider: None,
+            };
+            let rt = enter_test_runtime();
+            let _runtime_guard = rt.enter();
+
+            provider
+                .set_config_default_model("claude-opus-4-6", Some(default_provider))
+                .unwrap_or_else(|e| {
+                    panic!("default_provider '{default_provider}' should apply: {e}")
+                });
+
+            assert_eq!(
+                provider.active_provider(),
+                ActiveProvider::Claude,
+                "default_provider '{default_provider}' routes to Claude",
+            );
+            assert_eq!(
+                provider.active_explicit_credential(),
+                (!expect_oauth).then_some(ResolvedCredential::ApiKey),
+                "default_provider '{default_provider}' explicit-pin visibility",
+            );
+            assert_eq!(
+                rt.block_on(anthropic.test_access_token_and_oauth_mode())
+                    .expect("token"),
+                (
+                    if expect_oauth {
+                        "oauth-access-token".to_string()
+                    } else {
+                        "sk-ant-test-api-key".to_string()
+                    },
+                    expect_oauth,
+                ),
+                "default_provider '{default_provider}' should resolve {expected:?}",
+            );
+        });
+    }
 }
 
 #[test]

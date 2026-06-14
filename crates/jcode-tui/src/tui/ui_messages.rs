@@ -71,6 +71,23 @@ pub(crate) fn render_assistant_message(
     lines
 }
 
+/// Render a collapsed/collapsing reasoning trace ("current" mode). The content is
+/// sentinel-wrapped dim+italic markup (reasoning lines and/or a `▸ thought for Xs`
+/// summary), so it reuses the standard markdown path that styles those runs dim.
+pub(crate) fn render_reasoning_message(
+    msg: &DisplayMessage,
+    width: u16,
+    _diff_mode: crate::config::DiffDisplayMode,
+) -> Vec<Line<'static>> {
+    let centered = markdown::center_code_blocks();
+    let wrap_width = centered_wrap_width(width, centered, 96);
+    let mut lines = markdown::render_markdown_with_width(&msg.content, Some(wrap_width));
+    if centered {
+        left_pad_lines_for_centered_mode(&mut lines, width);
+    }
+    lines
+}
+
 fn render_assistant_tool_call_lines(
     tool_calls: &[String],
     width: usize,
@@ -323,13 +340,9 @@ fn content_has_markdown_formatting(content: &str) -> bool {
             || trimmed.starts_with("```")
             || trimmed.starts_with("~~~")
             || trimmed.starts_with('|')
-            || trimmed
-                .split_once('.')
-                .is_some_and(|(num, rest)| {
-                    !num.is_empty()
-                        && num.chars().all(|c| c.is_ascii_digit())
-                        && rest.starts_with(' ')
-                })
+            || trimmed.split_once('.').is_some_and(|(num, rest)| {
+                !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+            })
     })
 }
 
@@ -1833,7 +1846,9 @@ pub(crate) fn render_tool_message(
                 intent: call
                     .get("intent")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()), thought_signature: None, };
+                    .map(|s| s.to_string()),
+                thought_signature: None,
+            };
 
             let sub_result = sub_results.get(&(i + 1));
             let sub_errored = sub_result.map(|result| result.errored).unwrap_or_else(|| {

@@ -167,11 +167,7 @@ pub fn format_account_model_availability_detail(
 }
 
 pub(crate) fn normalize_model_id(model: &str) -> String {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized
-        .strip_suffix("[1m]")
-        .unwrap_or(&normalized)
-        .to_string()
+    jcode_provider_core::model_id::canonical(model)
 }
 
 fn normalize_provider_id(provider: &str) -> String {
@@ -197,10 +193,16 @@ fn current_claude_account_scope() -> String {
 }
 
 fn current_anthropic_catalog_scope() -> String {
-    if std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .map(|key| !key.trim().is_empty())
-        .unwrap_or(false)
+    // Match the credential-resolution order used by the Anthropic provider:
+    // the API key can come from the process env *or* the persisted
+    // anthropic.env file. Checking only the env var made env-file-keyed
+    // sessions read/write the OAuth scope while requests actually used the
+    // API key, so the `api-key` catalog scope went permanently stale.
+    if crate::provider_catalog::load_api_key_from_env_or_config(
+        "ANTHROPIC_API_KEY",
+        "anthropic.env",
+    )
+    .is_some()
     {
         "api-key".to_string()
     } else {
@@ -400,7 +402,7 @@ fn hydrate_catalog_cache_from_disk(
     }
 
     let observed_at = system_time_from_unix_secs(persisted.observed_at_unix_secs);
-    service.replace_scope_models(scope, normalized, observed_at);
+    service.hydrate_scope_models_from_snapshot(scope, normalized, observed_at);
     if !persisted.context_limits.is_empty() {
         populate_context_limits(persisted.context_limits.clone());
     }
@@ -418,6 +420,16 @@ pub fn cached_openai_model_ids() -> Option<Vec<String>> {
     let scope = current_openai_account_scope();
     live_catalog_model_ids(&OPENAI_MODEL_CATALOG_SERVICE, &scope)
         .or_else(|| load_openai_catalog_from_disk(&scope))
+}
+
+/// Test-only: clear the process-global in-memory model catalogs. The catalog
+/// services are statics shared by every test in the process; a test that
+/// hydrates a scope (directly or via `persist_*` + `cached_*`) otherwise leaks
+/// fixture models into later tests' `known_*_model_ids()` validation.
+#[cfg(test)]
+pub(crate) fn reset_model_catalog_services_for_tests() {
+    OPENAI_MODEL_CATALOG_SERVICE.reset_for_tests();
+    ANTHROPIC_MODEL_CATALOG_SERVICE.reset_for_tests();
 }
 
 pub fn persist_openai_model_catalog(catalog: &OpenAIModelCatalog) {
@@ -981,9 +993,9 @@ pub fn provider_for_model_with_hint(
     let model = model.trim();
     if model.contains('@') {
         Some("openrouter")
-    } else if ALL_CLAUDE_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_CLAUDE_MODELS) {
         Some("claude")
-    } else if ALL_OPENAI_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_OPENAI_MODELS) {
         Some("openai")
     } else if crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model) {
         Some("bedrock")

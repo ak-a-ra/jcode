@@ -1036,6 +1036,7 @@ pub fn download_and_install_blocking_with_progress(
         let version = release.tag_name.trim_start_matches('v');
         let dest_dir = build::builds_dir()?.join("versions").join(version);
         fs::create_dir_all(&dest_dir).context("Failed to create version install dir")?;
+        let mut installed_files = Vec::new();
         for entry in fs::read_dir(&extract_dir).context("Failed to read extracted archive")? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -1062,6 +1063,17 @@ pub fn download_and_install_blocking_with_progress(
                 || dest.extension().is_some_and(|ext| ext == "bin")
             {
                 crate::platform::set_permissions_executable(&dest)?;
+            }
+            installed_files.push(dest);
+        }
+        // Give every installed file the same mtime. The wrapper script and the
+        // `.bin` payload otherwise land with whatever sub-second skew the copy
+        // loop produced, and any code comparing binary freshness by mtime then
+        // sees two "different age" files for one logical install.
+        let install_stamp = SystemTime::now();
+        for path in &installed_files {
+            if let Ok(file) = fs::File::options().write(true).open(path) {
+                let _ = file.set_modified(install_stamp);
             }
         }
         let _ = fs::remove_dir_all(&extract_dir);
@@ -1157,6 +1169,7 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             }
         }
         Ok(None) => {
+            repair_stale_shared_server_after_no_update();
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
             let mut metadata = UpdateMetadata::load().unwrap_or_default();
             metadata.last_check = SystemTime::now();
@@ -1167,6 +1180,27 @@ pub fn check_and_maybe_update(auto_install: bool) -> UpdateCheckResult {
             let msg = format!("Check failed: {}", e);
             Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Error(msg.clone())));
             UpdateCheckResult::Error(msg)
+        }
+    }
+}
+
+fn repair_stale_shared_server_after_no_update() {
+    match build::repair_stale_shared_server_channel() {
+        Ok(build::SharedServerRepair::Repaired {
+            previous,
+            repaired_to,
+        }) => {
+            crate::logging::info(&format!(
+                "update: repaired stale shared-server channel {:?} -> {} after no-op update check",
+                previous, repaired_to
+            ));
+        }
+        Ok(build::SharedServerRepair::AlreadyCurrent) => {}
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "update: failed to repair stale shared-server channel after no-op update check: {}",
+                error
+            ));
         }
     }
 }
@@ -1401,10 +1435,9 @@ mod tests {
                         let trimmed = line.trim_end();
                         if let Some(rest) =
                             trimmed.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            && let Some(start) = rest.split('-').next()
                         {
-                            if let Some(start) = rest.split('-').next() {
-                                range_start = start.trim().parse().unwrap_or(0);
-                            }
+                            range_start = start.trim().parse().unwrap_or(0);
                         }
                         if trimmed.is_empty() {
                             break;

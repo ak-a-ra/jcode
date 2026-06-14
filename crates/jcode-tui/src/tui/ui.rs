@@ -76,6 +76,8 @@ mod file_diff_ui;
 mod frame_metrics;
 #[path = "ui_header.rs"]
 mod header;
+#[path = "ui_inline_image.rs"]
+pub(crate) mod inline_image_ui;
 #[path = "ui_inline_interactive.rs"]
 mod inline_interactive_ui;
 #[path = "ui_inline.rs"]
@@ -96,6 +98,8 @@ mod overlays;
 mod pinned_ui;
 #[path = "ui_prepare.rs"]
 mod prepare;
+#[path = "ui_smoothness.rs"]
+mod smoothness;
 #[path = "ui_tools.rs"]
 pub(crate) mod tools_ui;
 #[path = "ui_transitions.rs"]
@@ -115,6 +119,7 @@ use changelog::get_grouped_changelog;
 use changelog::{ChangelogEntry, group_changelog_entries, parse_changelog_from};
 use debug_capture::{
     build_info_widget_summary, capture_widget_placements, rect_within_bounds, rects_overlap,
+    widget_overlaps_content,
 };
 pub use diagram_pane::{
     PinnedDiagramLiveDebugSnapshot, PinnedDiagramProbeRect, debug_probe_pinned_diagram,
@@ -148,8 +153,8 @@ use memory_ui::{group_into_tiles, render_memory_tiles, split_by_display_width};
 use messages::get_cached_message_lines;
 #[cfg_attr(test, allow(unused_imports))]
 pub(crate) use messages::{
-    render_assistant_message, render_background_task_message, render_swarm_message,
-    render_system_message, render_tool_message, render_usage_message,
+    render_assistant_message, render_background_task_message, render_reasoning_message,
+    render_swarm_message, render_system_message, render_tool_message, render_usage_message,
 };
 pub use pinned_ui::{
     SidePanelDebugStats, SidePanelMermaidProbe, SidePanelMermaidProbeRect,
@@ -188,6 +193,23 @@ static PINNED_PANE_TOTAL_LINES: AtomicUsize = AtomicUsize::new(0);
 /// Effective scroll position of the side pane after render-time clamping.
 #[cfg(not(test))]
 static LAST_DIFF_PANE_EFFECTIVE_SCROLL: AtomicUsize = AtomicUsize::new(0);
+/// Total wrapped line count of the chat transcript on the most recent frame.
+/// Used together with `LAST_RESOLVED_CHAT_SCROLL` to anchor the viewport when
+/// older compacted history is loaded in (so the content under the reader stays
+/// put instead of teleporting to the new absolute top).
+#[cfg(not(test))]
+static LAST_TOTAL_WRAPPED_LINES: AtomicUsize = AtomicUsize::new(0);
+/// The chat scroll offset the renderer actually used on the most recent frame
+/// (after clamping and after resolving any pending history anchor). Scroll
+/// handlers adopt this so manual scrolling resumes from the on-screen position.
+#[cfg(not(test))]
+static LAST_RESOLVED_CHAT_SCROLL: AtomicUsize = AtomicUsize::new(0);
+/// Whether the tail-follow viewport is mid catch-up slide (a large content
+/// append is being scrolled into view over several frames instead of jumping).
+/// Drives the redraw loop so the slide completes promptly.
+#[cfg(not(test))]
+static TAIL_CATCHUP_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Wrapped line indices where each user prompt starts (updated each render frame).
 /// Used by prompt-jump keybindings (Ctrl+5..9, Ctrl+[/]) for accurate positioning.
 #[cfg(not(test))]
@@ -199,6 +221,9 @@ thread_local! {
     static TEST_LAST_CHAT_SCROLLBAR_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static TEST_PINNED_PANE_TOTAL_LINES: Cell<usize> = const { Cell::new(0) };
     static TEST_LAST_DIFF_PANE_EFFECTIVE_SCROLL: Cell<usize> = const { Cell::new(0) };
+    static TEST_LAST_TOTAL_WRAPPED_LINES: Cell<usize> = const { Cell::new(0) };
+    static TEST_LAST_RESOLVED_CHAT_SCROLL: Cell<usize> = const { Cell::new(0) };
+    static TEST_TAIL_CATCHUP_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static TEST_LAST_USER_PROMPT_POSITIONS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static TEST_LAST_LAYOUT: RefCell<Option<LayoutSnapshot>> = const { RefCell::new(None) };
     static TEST_LAST_STATUS_AREA: RefCell<Option<Rect>> = const { RefCell::new(None) };
@@ -342,6 +367,81 @@ pub(crate) fn set_last_diff_pane_effective_scroll(value: usize) {
     #[cfg(not(test))]
     {
         LAST_DIFF_PANE_EFFECTIVE_SCROLL.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Total wrapped line count of the chat transcript on the most recent frame.
+/// Returns 0 if no frame has been rendered yet.
+pub fn last_total_wrapped_lines() -> usize {
+    #[cfg(test)]
+    {
+        return TEST_LAST_TOTAL_WRAPPED_LINES.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        LAST_TOTAL_WRAPPED_LINES.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_last_total_wrapped_lines(value: usize) {
+    #[cfg(test)]
+    {
+        TEST_LAST_TOTAL_WRAPPED_LINES.with(|cell| cell.set(value));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        LAST_TOTAL_WRAPPED_LINES.store(value, Ordering::Relaxed);
+    }
+}
+
+/// The chat scroll offset the renderer actually used on the most recent frame
+/// (after clamping and after resolving any pending history anchor).
+pub fn last_resolved_chat_scroll() -> usize {
+    #[cfg(test)]
+    {
+        return TEST_LAST_RESOLVED_CHAT_SCROLL.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        LAST_RESOLVED_CHAT_SCROLL.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_last_resolved_chat_scroll(value: usize) {
+    #[cfg(test)]
+    {
+        TEST_LAST_RESOLVED_CHAT_SCROLL.with(|cell| cell.set(value));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        LAST_RESOLVED_CHAT_SCROLL.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Whether the tail-follow viewport is still sliding toward the bottom after a
+/// large append. The redraw loop keeps animation cadence while this is set.
+pub(crate) fn tail_catchup_active() -> bool {
+    #[cfg(test)]
+    {
+        return TEST_TAIL_CATCHUP_ACTIVE.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        TAIL_CATCHUP_ACTIVE.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_tail_catchup_active(active: bool) {
+    #[cfg(test)]
+    {
+        TEST_TAIL_CATCHUP_ACTIVE.with(|cell| cell.set(active));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        TAIL_CATCHUP_ACTIVE.store(active, Ordering::Relaxed);
     }
 }
 
@@ -716,6 +816,14 @@ struct BodyCacheKey {
     messages_version: u64,
     diagram_mode: crate::config::DiagramDisplayMode,
     centered: bool,
+    /// Whether inline images render at all (Alt+M hides them).
+    pin_images: bool,
+    /// Whether inline images render expanded or as collapsed label stubs
+    /// (Alt+Shift+I toggles; persisted).
+    inline_images_visible: bool,
+    /// Signature of the inline image set; anchored images render inside the
+    /// body, so the body must rebuild when images arrive or change.
+    images_signature: (usize, u64),
 }
 
 #[derive(Clone)]
@@ -785,6 +893,12 @@ impl BodyCacheState {
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -798,6 +912,12 @@ impl BodyCacheState {
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -831,6 +951,12 @@ impl BodyCacheState {
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (false, idx, entry.msg_count));
@@ -845,6 +971,12 @@ impl BodyCacheState {
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (true, idx, entry.msg_count));
@@ -933,6 +1065,9 @@ struct FullPrepCacheKey {
     streaming_text_len: usize,
     streaming_text_hash: u64,
     batch_progress_hash: u64,
+    inline_images_signature: (usize, u64),
+    /// Whether inline images render expanded or as collapsed label stubs.
+    inline_images_visible: bool,
 }
 
 #[derive(Clone)]
@@ -1094,6 +1229,9 @@ pub(crate) use frame_metrics::{
     debug_flicker_frame_history, debug_slow_frame_history, recent_flicker_copy_target_for_key,
     recent_flicker_ui_notice,
 };
+#[cfg(test)]
+pub(crate) use smoothness::frame_from_buffer as smoothness_frame_from_buffer;
+pub(crate) use smoothness::{report_json as smoothness_report_json, reset as smoothness_reset};
 
 #[cfg(test)]
 pub(crate) use frame_metrics::{
@@ -1167,6 +1305,8 @@ pub(crate) fn clear_test_render_state_for_tests() {
     set_last_max_scroll(0);
     set_pinned_pane_total_lines(0);
     set_last_diff_pane_effective_scroll(0);
+    set_last_total_wrapped_lines(0);
+    set_last_resolved_chat_scroll(0);
     update_user_prompt_positions(&[]);
     TEST_LAST_LAYOUT.with(|snapshot| {
         *snapshot.borrow_mut() = None;
@@ -1632,9 +1772,17 @@ pub(crate) fn copy_pane_vertical_edge_point(
     let zone = edge_autoscroll_zone_rows(area.height);
     let top_trigger = area.y.saturating_add(zone);
     let bottom_trigger = last_row.saturating_sub(zone);
-    let (edge_row, upward) = if row <= top_trigger {
+    // Only engage the hot zone when there is actually more transcript to pull in
+    // that direction. Otherwise dragging into the bottom band while the view is
+    // already pinned to the end (the common case) would snap the selection to the
+    // last visible line and fight precise highlighting of the bottom rows. When
+    // there is nothing to scroll, fall through (`None`) so the caller extends the
+    // selection to the exact cell under the cursor instead.
+    let can_scroll_up = snapshot.scroll > 0;
+    let can_scroll_down = snapshot.visible_end < snapshot.wrapped_plain_line_count();
+    let (edge_row, upward) = if row <= top_trigger && can_scroll_up {
         (area.y, true)
-    } else if row >= bottom_trigger {
+    } else if row >= bottom_trigger && can_scroll_down {
         (last_row, false)
     } else {
         return None;
@@ -1643,6 +1791,78 @@ pub(crate) fn copy_pane_vertical_edge_point(
     let clamped_col = column.clamp(area.x, area.x.saturating_add(area.width).saturating_sub(1));
 
     copy_point_from_snapshot(&snapshot, clamped_col, edge_row).map(|point| (point, upward))
+}
+
+/// Resolve the selection point for a drag at `(column, row)`, clamping vertical
+/// overshoot to the nearest in-bounds line edge.
+///
+/// Terminals report a drag that "leaves" the pane on the boundary row, but a
+/// drag *into the empty space below the last content line* (common with short
+/// transcripts that leave blank rows underneath) lands on a row that maps to no
+/// line at all, so `copy_point_from_screen` returns `None`. Native terminal and
+/// browser selection treat that as "select through the end of the last line".
+/// This mirrors that: dragging below the last visible line snaps to the end of
+/// that line, and dragging above the first visible line snaps to its start, so
+/// the boundary line is fully covered even when there is nothing more to scroll.
+pub(crate) fn copy_pane_drag_point(
+    pane: crate::tui::CopySelectionPane,
+    column: u16,
+    row: u16,
+) -> Option<crate::tui::CopySelectionPoint> {
+    let snapshot = copy_snapshot_for_pane(pane)?;
+    let area = snapshot.content_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    // A direct hit on a real line wins: precise per-cell selection.
+    if let Some(point) = copy_point_from_snapshot(&snapshot, column, row) {
+        return Some(point);
+    }
+
+    let line_count = snapshot.wrapped_plain_line_count();
+    if line_count == 0 {
+        return None;
+    }
+    let last_line = line_count.saturating_sub(1);
+    let last_visible_line = snapshot.visible_end.saturating_sub(1).min(last_line);
+    let first_visible_line = snapshot.scroll.min(last_line);
+
+    let last_row = area.y.saturating_add(area.height).saturating_sub(1);
+    let clamped_col = column.clamp(area.x, area.x.saturating_add(area.width).saturating_sub(1));
+
+    // Below the visible content: snap to the end of the last visible line.
+    if row >= last_row {
+        let text = snapshot.wrapped_plain_line(last_visible_line).unwrap_or("");
+        return Some(crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: last_visible_line,
+            column: line_display_width(text),
+        });
+    }
+
+    // Above the visible content: snap to the start of the first visible line.
+    if row <= area.y {
+        return Some(crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: first_visible_line,
+            column: snapshot
+                .wrapped_copy_offset(first_visible_line)
+                .unwrap_or(0),
+        });
+    }
+
+    // Interior row that maps to no line (e.g. a blank gap row between/after
+    // content within the visible band): fall back to the boundary-clamped point.
+    copy_point_from_snapshot(&snapshot, clamped_col, row.clamp(area.y, last_row)).or(Some(
+        crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: last_visible_line,
+            column: line_display_width(
+                snapshot.wrapped_plain_line(last_visible_line).unwrap_or(""),
+            ),
+        },
+    ))
 }
 
 /// Edge point for tick-driven continuous auto-scroll, where there is no live
@@ -1778,15 +1998,15 @@ pub(crate) fn copy_selection_text(range: crate::tui::CopySelectionRange) -> Opti
                 continue;
             }
         }
-        let line_width = line_display_width(&text);
+        let line_width = line_display_width(text);
         let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
         let start_col = if abs_line == start.abs_line {
-            clamp_display_col(&text, start.column).max(copy_start)
+            clamp_display_col(text, start.column).max(copy_start)
         } else {
             copy_start
         };
         let end_col = if abs_line == end.abs_line {
-            clamp_display_col(&text, end.column).max(copy_start)
+            clamp_display_col(text, end.column).max(copy_start)
         } else {
             line_width
         };
@@ -1795,14 +2015,80 @@ pub(crate) fn copy_selection_text(range: crate::tui::CopySelectionRange) -> Opti
             continue;
         }
 
-        let slice = display_col_slice(&text, start_col, end_col);
+        let slice = display_col_slice(text, start_col, end_col);
         if abs_line == start.abs_line {
             out.reserve(slice.len().saturating_mul(selected_lines.min(8)));
         }
-        out.push_str(&slice);
+        out.push_str(slice);
     }
 
     Some(out)
+}
+
+/// Compute `(char_count, line_count)` for the current copy selection without
+/// allocating the full joined selection string. Mirrors `copy_selection_text`
+/// so the status line "N chars · M lines" matches what would be copied, but is
+/// allocation-free so it can run cheaply on every render frame / drag move.
+pub(crate) fn copy_selection_metrics(
+    range: crate::tui::CopySelectionRange,
+) -> Option<(usize, usize)> {
+    if range.start.pane != range.end.pane {
+        return None;
+    }
+    let snapshot = copy_snapshot_for_pane(range.start.pane)?;
+    let (start, end) =
+        if (range.start.abs_line, range.start.column) <= (range.end.abs_line, range.end.column) {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+
+    if start.abs_line >= snapshot.wrapped_plain_line_count()
+        || end.abs_line >= snapshot.wrapped_plain_line_count()
+    {
+        return None;
+    }
+
+    if let Some(metrics) =
+        copy_selection::copy_selection_metrics_from_raw_lines(&snapshot, start, end)
+    {
+        return Some(metrics);
+    }
+
+    let mut chars = 0usize;
+    let mut lines = 0usize;
+    for abs_line in start.abs_line..=end.abs_line {
+        if abs_line > start.abs_line {
+            chars += 1; // joining '\n'
+        }
+        lines += 1;
+        let text = snapshot.wrapped_plain_line(abs_line)?;
+        if abs_line != start.abs_line && abs_line != end.abs_line {
+            let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
+            if copy_start == 0 {
+                chars += text.chars().count();
+                continue;
+            }
+        }
+        let line_width = line_display_width(text);
+        let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
+        let start_col = if abs_line == start.abs_line {
+            clamp_display_col(text, start.column).max(copy_start)
+        } else {
+            copy_start
+        };
+        let end_col = if abs_line == end.abs_line {
+            clamp_display_col(text, end.column).max(copy_start)
+        } else {
+            line_width
+        };
+        if end_col < start_col {
+            continue;
+        }
+        chars += display_col_slice(text, start_col, end_col).chars().count();
+    }
+
+    Some((chars, lines.max(1)))
 }
 
 pub(crate) fn link_target_from_screen(column: u16, row: u16) -> Option<String> {
@@ -1936,14 +2222,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let pane_position = app.diagram_pane_position();
     let has_side_panel_content = app.side_panel().focused_page().is_some();
     let diff_mode = app.diff_mode();
-    let pin_images = app.pin_images();
     let collect_diffs = diff_mode.is_pinned();
-    let has_pinned_content = if collect_diffs || pin_images {
+    // Images now render inline in the transcript, so the side panel only handles
+    // pinned file diffs. `pin_images` no longer feeds the side-panel surface.
+    let has_pinned_content = if collect_diffs {
         collect_pinned_content_cached(
             app.display_messages(),
             &app.side_pane_images(),
             collect_diffs,
-            pin_images,
+            false,
             app.display_messages_version(),
         )
     } else {
@@ -2345,6 +2632,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
             right_widths: Vec::new(),
             left_widths: Vec::new(),
             centered: app.centered_mode(),
+            ..Default::default()
         }
     } else {
         draw_messages(
@@ -2486,12 +2774,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 placements: placement_captures,
             });
 
-            // Detect overlaps with message area
+            // Detect overlaps with used content. Info widgets live inside the
+            // messages rectangle by design, so a whole-area overlap check is
+            // always true and useless; instead verify each placement still fits
+            // within the free margin the layout reported for the rows it covers.
             for placement in &placements {
-                if rects_overlap(placement.rect, widget_bounds) {
+                if widget_overlaps_content(placement, widget_bounds, &margins) {
                     capture.anomaly(format!(
-                        "Info widget {:?} overlaps messages area",
-                        placement.kind
+                        "Info widget {:?} intrudes into content (rect {:?})",
+                        placement.kind, placement.rect
                     ));
                 }
                 if !rect_within_bounds(placement.rect, area) {
@@ -2536,6 +2827,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     if visual_debug::overlay_enabled() {
         overlays::draw_debug_overlay(frame, &placements, &chunks);
     }
+
+    // Observe the rendered messages area for the anchor-stability (smoothness)
+    // report. Runs on the final buffer so it sees exactly what the user sees.
+    smoothness::observe_frame(
+        frame.buffer_mut(),
+        messages_area,
+        app.scroll_offset(),
+        !app.auto_scroll_paused(),
+    );
 
     // Record the frame capture if enabled
     if let Some(capture) = debug_capture {

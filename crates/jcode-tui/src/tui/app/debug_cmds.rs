@@ -115,6 +115,27 @@ impl App {
             })
             .to_string();
         }
+        if cmd == "stream-jitter" {
+            // Arrival-vs-reveal smoothness report for the paced stream buffer.
+            // `reveals.bucket_100ms_cv` well below `arrivals.bucket_100ms_cv`
+            // means pacing is smoothing provider bursts (text and reasoning).
+            return serde_json::to_string_pretty(&self.stream_buffer.jitter_profile())
+                .unwrap_or_else(|_| "{}".to_string());
+        }
+        if cmd == "stream-jitter:reset" {
+            self.stream_buffer.reset_jitter();
+            return "OK: stream jitter stats reset".to_string();
+        }
+        if cmd == "smoothness" {
+            // Anchor-stability report: jarring transcript motion (repositions,
+            // insertions above, big pops, blinks, mass reflows) per rendered
+            // frame, with expected motion (scroll/resize/tail-follow) excluded.
+            return crate::tui::ui::smoothness_report_json();
+        }
+        if cmd == "smoothness:reset" {
+            crate::tui::ui::smoothness_reset();
+            return "OK: smoothness stats reset".to_string();
+        }
         if cmd == "overlay" || cmd == "overlay:status" {
             let overlay = crate::tui::visual_debug::overlay_enabled();
             return serde_json::json!({
@@ -207,7 +228,9 @@ impl App {
                             "old_string": old_string,
                             "new_string": new_string,
                         }),
-                        intent: None, thought_signature: None, },
+                        intent: None,
+                        thought_signature: None,
+                    },
                 ),
             ];
             self.bump_display_messages_version();
@@ -531,6 +554,9 @@ impl App {
         } else if cmd == "scroll-suite" || cmd.starts_with("scroll-suite:") {
             let raw = cmd.strip_prefix("scroll-suite:");
             self.run_scroll_suite(raw)
+        } else if cmd == "widget-stability" || cmd.starts_with("widget-stability:") {
+            let raw = cmd.strip_prefix("widget-stability:");
+            self.run_widget_stability(raw)
         } else if cmd == "side-panel-latency" || cmd.starts_with("side-panel-latency:") {
             let raw = cmd.strip_prefix("side-panel-latency:");
             self.run_side_panel_latency_bench(raw)
@@ -716,6 +742,7 @@ impl App {
                  - scroll:<up|down|top|bottom> - control scroll\n\
                  - scroll-test[:<json>] - run offscreen scroll+diagram test\n\
                  - scroll-suite[:<json>] - run scroll+diagram test suite\n\
+                 - widget-stability[:<json>] - quantify info-widget movement while scrolling current transcript\n\
                  - side-panel-latency[:<json>] - benchmark headless side-panel input->frame latency\n\
                  - keys:<keyspec> - inject key events (e.g. keys:ctrl+r)\n\
                  - input - get current input buffer\n\

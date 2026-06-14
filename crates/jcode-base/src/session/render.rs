@@ -1,7 +1,9 @@
 use super::{Session, StoredDisplayRole};
 use crate::message::{ContentBlock, Role, ToolCall};
+use jcode_config_types::ReasoningDisplayMode;
 pub use jcode_session_types::{
-    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageSource, RenderedMessage,
+    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageAnchor, RenderedImageSource,
+    RenderedMessage,
 };
 use std::collections::HashMap;
 
@@ -16,13 +18,29 @@ pub const DEFAULT_VISIBLE_COMPACTED_HISTORY_MESSAGES: usize = 64;
 /// by the live streaming path. Each line is wrapped via the shared `reasoning_line_markup` so resumed
 /// sessions render reasoning identically to how it streamed, terminated by a
 /// blank line so following answer text renders as a normal paragraph.
+///
+/// Honors the active `reasoning_display` mode so re-rendered history (reload,
+/// resume, remote sync, compaction-window expand) matches the live behavior:
+/// - `Off`: persisted reasoning is hidden entirely.
+/// - `Current`: only the *live* reasoning block is ever shown, so historical
+///   reasoning is hidden on re-render (the live block already streamed and was
+///   discarded once the model answered), matching the ephemeral live behavior.
+/// - `Full`: every reasoning line is shown (classic behavior).
 fn format_reasoning_markup(text: &str) -> String {
     if text.trim().is_empty() {
         return String::new();
     }
+    let mode = crate::config::config().display.reasoning_display();
+    match mode {
+        // In both `Off` and `Current` modes persisted reasoning is not re-rendered:
+        // `Current` only ever shows the live block, which is discarded once the
+        // model answers, so reloaded history shows no past reasoning.
+        ReasoningDisplayMode::Off | ReasoningDisplayMode::Current => return String::new(),
+        ReasoningDisplayMode::Full => {}
+    }
     let mut out = String::new();
     for line in text.split('\n') {
-        out.push_str(&jcode_tui_markdown::reasoning_line_markup(line));
+        out.push_str(&jcode_render_core::reasoning_line_markup(line));
     }
     // Blank line terminates the reasoning block.
     out.push('\n');
@@ -166,6 +184,24 @@ fn image_source_for_message(role: Role, tool: Option<&ToolCall>) -> RenderedImag
     }
 }
 
+fn image_anchor_for_message(
+    rendered_role: &str,
+    tool: Option<&ToolCall>,
+    user_prompt_ordinal: usize,
+) -> Option<RenderedImageAnchor> {
+    if let Some(tool) = tool {
+        return Some(RenderedImageAnchor::ToolCall {
+            id: tool.id.clone(),
+        });
+    }
+    if rendered_role == "user" {
+        return Some(RenderedImageAnchor::UserPrompt {
+            ordinal: user_prompt_ordinal,
+        });
+    }
+    None
+}
+
 fn fallback_image_label_for_tool(tool: &ToolCall) -> Option<String> {
     tool.input
         .get("file_path")
@@ -184,6 +220,15 @@ fn parse_attached_image_label(text: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// True when `text` is exactly an attached-image label message (the synthetic
+/// "[Attached image associated with the preceding tool result: ...]" text that
+/// follows tool-result images). UIs use this to keep user-prompt ordinals
+/// consistent between live transcripts (which never show these) and rendered
+/// history (which does).
+pub fn is_attached_image_label_text(text: &str) -> bool {
+    parse_attached_image_label(text).is_some()
 }
 
 pub fn render_images(session: &Session) -> Vec<RenderedImage> {
@@ -269,6 +314,9 @@ pub fn render_messages_and_images_with_compacted_history(
     let mut rendered: Vec<RenderedMessage> = Vec::new();
     let mut images: Vec<RenderedImage> = Vec::new();
     let mut tool_map: HashMap<String, ToolCall> = HashMap::new();
+    // 0-based ordinal of the next rendered user prompt, used to anchor pasted
+    // user images to their prompt in the transcript.
+    let mut user_prompt_count = 0usize;
     let compacted_count = session
         .compaction
         .as_ref()
@@ -336,6 +384,10 @@ pub fn render_messages_and_images_with_compacted_history(
         let mut tool_calls: Vec<String> = Vec::new();
         let mut current_tool: Option<ToolCall> = None;
         let mut last_image_idx: Option<usize> = None;
+        // Images from blocks with no owning tool result (e.g. a pasted user
+        // screenshot). Their user-prompt ordinal is only known once we know the
+        // message actually renders a user prompt, so patch them afterwards.
+        let mut pending_prompt_image_indices: Vec<usize> = Vec::new();
 
         for block in &msg.content {
             match block {
@@ -370,6 +422,9 @@ pub fn render_messages_and_images_with_compacted_history(
                     ..
                 } => {
                     if !text.is_empty() {
+                        if role == "user" && !is_attached_image_label_text(&text) {
+                            user_prompt_count += 1;
+                        }
                         rendered.push(RenderedMessage {
                             role: role.to_string(),
                             content: std::mem::take(&mut text),
@@ -396,12 +451,14 @@ pub fn render_messages_and_images_with_compacted_history(
                         tool_data,
                     });
                 }
-                ContentBlock::Reasoning { text: t }
-                | ContentBlock::ReasoningTrace { text: t } => {
+                ContentBlock::Reasoning { text: t } | ContentBlock::ReasoningTrace { text: t } => {
                     text.push_str(&format_reasoning_markup(t));
                 }
                 ContentBlock::AnthropicThinking { .. } | ContentBlock::OpenAIReasoning { .. } => {}
                 ContentBlock::Image { media_type, data } => {
+                    let anchor =
+                        image_anchor_for_message(role, current_tool.as_ref(), user_prompt_count);
+                    let is_pending_prompt_anchor = current_tool.is_none() && role == "user";
                     images.push(RenderedImage {
                         media_type: media_type.clone(),
                         data: data.clone(),
@@ -412,20 +469,36 @@ pub fn render_messages_and_images_with_compacted_history(
                             message_role.clone(),
                             current_tool.as_ref(),
                         ),
+                        anchor,
                     });
                     last_image_idx = Some(images.len().saturating_sub(1));
+                    if is_pending_prompt_anchor {
+                        pending_prompt_image_indices.push(images.len() - 1);
+                    }
                 }
                 ContentBlock::OpenAICompaction { .. } => {}
             }
         }
 
         if !text.is_empty() {
+            if role == "user" && !is_attached_image_label_text(&text) {
+                user_prompt_count += 1;
+            }
             rendered.push(RenderedMessage {
                 role: role.to_string(),
                 content: text,
                 tool_calls,
                 tool_data: None,
             });
+        } else if !pending_prompt_image_indices.is_empty() {
+            // The message carried images but produced no rendered user prompt;
+            // drop the anchor so these images fall back to the transcript tail
+            // instead of pointing at the wrong prompt.
+            for idx in pending_prompt_image_indices {
+                if let Some(image) = images.get_mut(idx) {
+                    image.anchor = None;
+                }
+            }
         }
     }
 

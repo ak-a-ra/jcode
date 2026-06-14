@@ -18,12 +18,12 @@ pub use crash::{
     CrashedSessionsInfo, detect_crashed_sessions, find_recent_crashed_sessions,
     find_session_by_name_or_id, recover_crashed_sessions, recover_crashed_sessions_by_ids,
 };
-pub use maintenance::prune_old_session_backups;
 pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
+pub use maintenance::prune_old_session_backups;
 pub use memory_profile::SessionMemoryProfileSnapshot;
 use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,
@@ -31,9 +31,10 @@ use memory_profile::{
 use model::SESSION_CONTEXT_PREFIX;
 pub use model::{StoredReplayEvent, StoredReplayEventKind};
 pub use render::{
-    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageSource, RenderedMessage,
-    has_rendered_images, render_images, render_messages, render_messages_and_images,
-    render_messages_and_images_with_compacted_history, summarize_tool_calls,
+    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageAnchor, RenderedImageSource,
+    RenderedMessage, has_rendered_images, is_attached_image_label_text, render_images,
+    render_messages, render_messages_and_images, render_messages_and_images_with_compacted_history,
+    summarize_tool_calls,
 };
 pub use storage_paths::session_journal_path_from_snapshot;
 #[cfg(test)]
@@ -910,6 +911,35 @@ impl Session {
             .unwrap_or(&self.id)
     }
 
+    /// Append a model-visible notice telling the agent this session is a fork
+    /// of `parent_session_id`'s conversation.
+    ///
+    /// Forking happens when the user splits a window mid-conversation (often
+    /// while the parent agent is still streaming) and points the new window at
+    /// a clone of the transcript. Without this notice the forked agent assumes
+    /// it owns the in-flight request, duplicating the parent's work. The
+    /// notice is wrapped in `<system-reminder>` so it stays out of the visible
+    /// transcript while still reaching the model on the next turn.
+    pub fn append_fork_notice(&mut self, parent_session_id: &str, parent_display_name: &str) {
+        let text = format!(
+            "<system-reminder>\nThis session was forked (split) from session {parent} ({parent_id}) by the user. \
+The full conversation above is inherited from that session, but the original agent in {parent} \
+is still active and will continue handling whatever request or work was in progress there. \
+Do NOT continue or duplicate that in-flight work here. Treat the next user message as a fresh \
+request in this new forked session, using the inherited conversation only as context.\n</system-reminder>",
+            parent = parent_display_name,
+            parent_id = parent_session_id,
+        );
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::System),
+        );
+    }
+
     /// Mark this session as a canary tester
     pub fn set_canary(&mut self, build_hash: &str) {
         self.is_canary = true;
@@ -1176,6 +1206,30 @@ impl Session {
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }
+    }
+
+    /// Drop oversized inline images from the stored transcript, oldest-first,
+    /// until the total remaining base64 image payload fits within
+    /// `target_total_chars`. Used to recover from provider HTTP 413
+    /// "request too large" errors, which are driven by base64 image payload size
+    /// rather than the token context window.
+    ///
+    /// Mutates and persists the authoritative transcript (replacing each dropped
+    /// image with a short text marker) and invalidates the provider-message
+    /// cache so the next API call reflects the reduced payload. Returns the
+    /// number of images that were stripped.
+    pub fn strip_oversized_images(&mut self, target_total_chars: usize) -> usize {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let stripped = jcode_compaction_core::strip_large_images_in_contents(
+            &mut contents,
+            target_total_chars,
+        );
+        if stripped > 0 {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+        }
+        stripped
     }
 
     pub fn visible_conversation_message_count(&self) -> usize {

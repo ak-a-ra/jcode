@@ -61,6 +61,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
     RegisteredCommand::public("/commit", "Make logical commits from current changes"),
+    RegisteredCommand::public(
+        "/commit-push",
+        "Make logical commits from current changes, then push",
+    ),
     RegisteredCommand::public("/transcript", "Open the current session transcript file"),
     RegisteredCommand::public("/subagent-model", "Show/change subagent model policy"),
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
@@ -71,7 +75,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/fast", "Toggle fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
-    RegisteredCommand::public("/reasoning", "Show/change reasoning display (off/full/current)"),
+    RegisteredCommand::public(
+        "/reasoning",
+        "Show/change reasoning display (off/full/current)",
+    ),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
@@ -110,6 +117,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/config", "Show or edit configuration"),
     RegisteredCommand::public("/log", "Mark the current location in the jcode logs"),
     RegisteredCommand::public(
+        "/keys",
+        "Show keybinding conflicts with your terminal and OS (/keys refresh to rescan)",
+    ),
+    RegisteredCommand::public(
         "/diff",
         "Cycle or set diff display mode (off/inline/full/pinned/file)",
     ),
@@ -146,6 +157,11 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/record", "Record a demo capture"),
     RegisteredCommand::remote("/client-reload", "Force reload client binary"),
     RegisteredCommand::remote("/server-reload", "Force reload server binary"),
+    RegisteredCommand::remote(
+        "/continue",
+        "Continue every interrupted live session that would auto-resume",
+    ),
+    RegisteredCommand::remote("/resumeall", "Alias for /continue"),
     RegisteredCommand::hidden("/z", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zz", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zzz", "Secret premium-mode command"),
@@ -1155,15 +1171,9 @@ impl App {
                 });
                 OnboardingWelcomeKind::Login { import: prompt }
             }
-            Some(OnboardingPhase::TelemetryConsent {
-                yes_highlighted,
-                shown_at,
-            }) => {
-                let total = crate::tui::app::onboarding_flow::DECISION_TIMEOUT.as_secs();
-                let seconds_left = total.saturating_sub(shown_at.elapsed().as_secs());
-                OnboardingWelcomeKind::TelemetryConsent {
+            Some(OnboardingPhase::LoginOpenAi { yes_highlighted }) => {
+                OnboardingWelcomeKind::LoginOpenAi {
                     yes_highlighted: *yes_highlighted,
-                    seconds_left,
                 }
             }
             Some(OnboardingPhase::ModelSelect) => OnboardingWelcomeKind::Suggestions,
@@ -1185,15 +1195,15 @@ impl App {
     }
 
     /// Whether the guided onboarding flow is in a phase that should take over
-    /// the welcome screen body (login, telemetry, or continue prompt). The
-    /// transcript-pick phase uses the session-picker overlay instead, and the
-    /// suggestions phase is the default welcome body.
+    /// the welcome screen body (login, OpenAI-login prompt, or continue prompt).
+    /// The transcript-pick phase uses the session-picker overlay instead, and
+    /// the suggestions phase is the default welcome body.
     fn onboarding_flow_drives_welcome(&self) -> bool {
         use crate::tui::app::onboarding_flow::OnboardingPhase;
         matches!(
             self.onboarding_phase(),
             Some(OnboardingPhase::Login { .. })
-                | Some(OnboardingPhase::TelemetryConsent { .. })
+                | Some(OnboardingPhase::LoginOpenAi { .. })
                 | Some(OnboardingPhase::ContinuePrompt { .. })
         )
     }
@@ -1223,16 +1233,7 @@ impl App {
         let is_new_user = if preview_mode {
             true
         } else {
-            crate::storage::jcode_dir()
-                .ok()
-                .and_then(|dir| {
-                    let path = dir.join("setup_hints.json");
-                    std::fs::read_to_string(&path).ok()
-                })
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .and_then(|v| v.get("launch_count")?.as_u64())
-                .map(|count| count <= 5)
-                .unwrap_or(true)
+            Self::is_new_user_install()
         };
 
         if !is_new_user {
@@ -1425,7 +1426,45 @@ struct ExternalCliSuggestionCandidate {
     context: Option<String>,
 }
 
+/// How long a scan of the external-CLI session directories is reused before we
+/// re-scan. The onboarding welcome screen animates a donut, so it redraws at
+/// animation FPS and calls [`latest_external_cli_continuation_prompt`] multiple
+/// times per frame. Scanning `~/.codex/sessions` / `~/.claude/projects` (reading
+/// and JSON-parsing the newest transcripts) can cost hundreds of milliseconds
+/// for users with large histories, which would otherwise make first-run
+/// onboarding extremely laggy. A short TTL keeps the suggestion fresh while
+/// reducing the cost to a single scan per window.
+const EXTERNAL_CLI_PROMPT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached result of the external-CLI continuation-prompt scan, with the time it
+/// was computed. `None` value means "scanned, but nothing found".
+type ExternalCliPromptCache = std::sync::RwLock<Option<(Option<String>, std::time::Instant)>>;
+static EXTERNAL_CLI_PROMPT_CACHE: std::sync::LazyLock<ExternalCliPromptCache> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Cached front-end for [`latest_external_cli_continuation_prompt_uncached`].
+///
+/// See [`EXTERNAL_CLI_PROMPT_CACHE_TTL`] for why this is cached: the uncached
+/// scan reads and parses the newest external transcripts, which is expensive for
+/// large histories and would otherwise run several times per onboarding frame.
 fn latest_external_cli_continuation_prompt() -> Option<String> {
+    if let Ok(cache) = EXTERNAL_CLI_PROMPT_CACHE.read()
+        && let Some((ref value, ref when)) = *cache
+        && when.elapsed() < EXTERNAL_CLI_PROMPT_CACHE_TTL
+    {
+        return value.clone();
+    }
+
+    let value = latest_external_cli_continuation_prompt_uncached();
+
+    if let Ok(mut cache) = EXTERNAL_CLI_PROMPT_CACHE.write() {
+        *cache = Some((value.clone(), std::time::Instant::now()));
+    }
+
+    value
+}
+
+fn latest_external_cli_continuation_prompt_uncached() -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let mut candidates = Vec::new();
     candidates.extend(latest_jsonl_suggestion_candidates(
@@ -1644,6 +1683,40 @@ fn compact_suggestion_text(text: &str, max_chars: usize) -> String {
 mod external_cli_suggestion_tests {
     use super::*;
     use std::io::Write;
+
+    /// Faithful, real-home measurement of the per-frame onboarding cost.
+    /// Ignored by default (depends on local ~/.codex and ~/.claude contents).
+    /// Run with:
+    ///   cargo test -p jcode-tui --lib onboarding_suggestion_scan_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn onboarding_suggestion_scan_cost() {
+        use std::time::Instant;
+
+        // Cold: the uncached scan that reads + JSON-parses the newest external
+        // transcripts. This is the work that used to run several times per frame.
+        let cold_start = Instant::now();
+        let cold = latest_external_cli_continuation_prompt_uncached();
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Warm: the cached front-end the onboarding screen actually calls. Prime
+        // the cache once, then measure repeated calls (as a redrawing frame does).
+        let _ = latest_external_cli_continuation_prompt();
+        let runs = 1000;
+        let warm_start = Instant::now();
+        let mut warm = None;
+        for _ in 0..runs {
+            warm = latest_external_cli_continuation_prompt();
+        }
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+        eprintln!(
+            "external-cli continuation prompt: cold(uncached)={cold_ms:.1} ms, \
+             warm(cached, avg of {runs})={warm_ms:.4} ms; cold_some={}, warm_some={}",
+            cold.is_some(),
+            warm.is_some()
+        );
+    }
 
     #[test]
     fn parses_claude_code_jsonl_with_session_path_and_context() {

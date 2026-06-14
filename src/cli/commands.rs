@@ -160,18 +160,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             user_id,
             helper,
             clear,
-        } => {
-            return run_cloud_sessions_configure(
-                api_base,
-                api_token,
-                api_token_env,
-                api_token_id,
-                user_id,
-                helper,
-                clear,
-            );
-        }
-        CloudSessionsSubcommand::Status { json } => return run_cloud_sessions_status(json),
+        } => run_cloud_sessions_configure(
+            api_base,
+            api_token,
+            api_token_env,
+            api_token_id,
+            user_id,
+            helper,
+            clear,
+        ),
+        CloudSessionsSubcommand::Status { json } => run_cloud_sessions_status(json),
         CloudSessionsSubcommand::Dashboard {
             limit,
             output,
@@ -181,18 +179,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
-                limit,
-                output,
-                open,
-                with_view,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
+            limit,
+            output,
+            open,
+            with_view,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         CloudSessionsSubcommand::Sync {
             sessions_dir,
             since_days,
@@ -207,23 +203,21 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_sync(CloudSessionsSyncRequest {
-                sessions_dir,
-                since_days,
-                all,
-                max,
-                min_interval_mins,
-                raw,
-                dry_run,
-                force,
-                json,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_sync(CloudSessionsSyncRequest {
+            sessions_dir,
+            since_days,
+            all,
+            max,
+            min_interval_mins,
+            raw,
+            dry_run,
+            force,
+            json,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         other => run_cloud_sessions_helper_command(other),
     }
 }
@@ -2154,6 +2148,34 @@ pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<(
     }
 
     let mut client = crate::server::Client::connect().await?;
+
+    // Before asking the (possibly older) daemon to reload, repair a stale
+    // `shared-server` channel from the client side. The running server resolves
+    // its reload target from that channel; if it still points at the server's
+    // own old binary (the "current client, stale server" state, e.g. after a
+    // no-op `/update`), a forced reload would just re-exec the same old binary.
+    // Repointing shared-server -> stable when stable is strictly newer gives the
+    // reload a newer binary to exec into. Never downgrades; preserves a fresher
+    // self-dev pin. Best-effort: a failure here must not block the reload.
+    match crate::build::repair_stale_shared_server_channel() {
+        Ok(crate::build::SharedServerRepair::Repaired {
+            repaired_to,
+            previous,
+        }) => {
+            crate::logging::info(&format!(
+                "server reload: repaired stale shared-server channel {:?} -> {} before reload",
+                previous, repaired_to
+            ));
+        }
+        Ok(crate::build::SharedServerRepair::AlreadyCurrent) => {}
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "server reload: shared-server channel repair failed (continuing): {}",
+                err
+            ));
+        }
+    }
+
     let request_id = client.reload_with_force(force).await?;
 
     let mut reloading = false;

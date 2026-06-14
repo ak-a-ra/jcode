@@ -608,12 +608,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                         Style::default().fg(dim_color()),
                     ),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Connecting(ref phase) => {
@@ -637,27 +632,17 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                     Span::styled(spinner, Style::default().fg(ai_color())),
                     Span::styled(label, Style::default().fg(label_color)),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Thinking(_start) => {
-                let mut label = format!(" thinking… {:.1}s", elapsed);
+                let mut label = format!(" thinking… {}", format_elapsed(elapsed));
                 append_transport_context(&mut label, app);
                 let mut spans = vec![
                     Span::styled(spinner, Style::default().fg(ai_color())),
                     Span::styled(label, Style::default().fg(dim_color())),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Streaming => {
@@ -710,12 +695,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                         Style::default().fg(rgb(255, 193, 7)),
                     ),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::RunningTool(ref name) => {
@@ -835,12 +815,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                     Style::default().fg(rgb(100, 100, 100)),
                 ));
 
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
         }
@@ -895,6 +870,18 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
     frame.render_widget(Paragraph::new(aligned_line), area);
 }
 
+/// Append the "+N queued" suffix span (in the queued accent color) when there
+/// are queued follow-up messages. Centralizes the repeated check/styling shared
+/// by every processing-status branch in `draw_status`.
+fn push_queued_suffix(spans: &mut Vec<Span<'static>>, queued_suffix: &str) {
+    if !queued_suffix.is_empty() {
+        spans.push(Span::styled(
+            queued_suffix.to_string(),
+            Style::default().fg(queued_color()),
+        ));
+    }
+}
+
 fn streaming_status_spans(
     spinner: &'static str,
     status_text: String,
@@ -912,12 +899,7 @@ fn streaming_status_spans(
             dim_color()
         }),
     ));
-    if !queued_suffix.is_empty() {
-        spans.push(Span::styled(
-            queued_suffix.to_string(),
-            Style::default().fg(queued_color()),
-        ));
-    }
+    push_queued_suffix(&mut spans, queued_suffix);
     spans
 }
 
@@ -925,6 +907,17 @@ fn streaming_status_spans(
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn overscroll_provider_display_is_credential_neutral() {
+        // The credential (OAuth vs API key) is reported by the adjacent auth
+        // chip from canonical resolution; the provider name must not bake in a
+        // credential or the two can contradict (e.g. "Claude OAuth · API key").
+        assert_eq!(overscroll_provider_display("claude"), "Claude");
+        assert_eq!(overscroll_provider_display("anthropic"), "Anthropic");
+        assert!(!overscroll_provider_display("claude").contains("OAuth"));
+        assert!(!overscroll_provider_display("anthropic").contains("API"));
+    }
 
     #[test]
     fn session_history_warning_is_clear_and_occasional() {
@@ -1067,7 +1060,9 @@ mod tests {
                     id: "batch-1-bash".to_string(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "cargo test -p jcode"}),
-                    intent: None, thought_signature: None, }],
+                    intent: None,
+                    thought_signature: None,
+                }],
                 subcalls: Vec::new(),
             }),
             Some(2),
@@ -1096,17 +1091,23 @@ mod tests {
                         id: "batch-2-grep".to_string(),
                         name: "grep".to_string(),
                         input: serde_json::json!({"pattern": "foo", "path": "src"}),
-                        intent: None, thought_signature: None, },
+                        intent: None,
+                        thought_signature: None,
+                    },
                     crate::message::ToolCall {
                         id: "batch-1-bash".to_string(),
                         name: "bash".to_string(),
                         input: serde_json::json!({"command": "cargo build --release --workspace"}),
-                        intent: None, thought_signature: None, },
+                        intent: None,
+                        thought_signature: None,
+                    },
                     crate::message::ToolCall {
                         id: "batch-3-read".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"file_path": "README.md"}),
-                        intent: None, thought_signature: None, },
+                        intent: None,
+                        thought_signature: None,
+                    },
                 ],
                 subcalls: Vec::new(),
             }),
@@ -1167,6 +1168,18 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), "⠋");
         assert_eq!(spans[1].content.as_ref(), " finalizing");
+    }
+
+    #[test]
+    fn push_queued_suffix_appends_only_when_present() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        push_queued_suffix(&mut spans, "");
+        assert!(spans.is_empty(), "empty suffix should add no span");
+
+        push_queued_suffix(&mut spans, " · +2 queued");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), " · +2 queued");
+        assert_eq!(spans[0].style.fg, Some(queued_color()));
     }
 
     #[test]
@@ -1599,8 +1612,13 @@ fn overscroll_is_runtime_placeholder(provider: &str) -> bool {
 
 fn overscroll_provider_display(provider: &str) -> String {
     match provider.to_ascii_lowercase().as_str() {
-        "claude" => "Claude OAuth".to_string(),
-        "anthropic" => "Anthropic API".to_string(),
+        // Keep provider labels credential-neutral: the adjacent auth chip
+        // (`overscroll_auth_label`) reports OAuth vs API key from the canonical
+        // credential resolution. Baking a credential into the provider name
+        // used to produce contradictions like "Claude OAuth · API key" when
+        // the Anthropic route was pinned to the API key.
+        "claude" => "Claude".to_string(),
+        "anthropic" => "Anthropic".to_string(),
         "openai" => "OpenAI".to_string(),
         "openrouter" => "OpenRouter".to_string(),
         "opencode" => "OpenCode".to_string(),

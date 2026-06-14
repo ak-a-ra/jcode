@@ -141,6 +141,12 @@ pub enum Request {
         allow_session_takeover: bool,
     },
 
+    /// Resume/continue every live session that was interrupted and would
+    /// auto-continue on a reload (e.g. crashed/errored mid-turn). This is the
+    /// on-demand equivalent of the automatic post-reload recovery sweep.
+    #[serde(rename = "resume_all_sessions")]
+    ResumeAllSessions { id: u64 },
+
     /// Deliver a scheduled task to a currently live session.
     #[serde(rename = "notify_session")]
     NotifySession {
@@ -719,6 +725,14 @@ pub enum ServerEvent {
     #[serde(rename = "message_end")]
     MessageEnd,
 
+    /// A transient transport fault interrupted the provider stream mid-response
+    /// and the provider is retrying the request from the top. The client must
+    /// discard all partial output from the current attempt (streamed text,
+    /// reasoning, in-progress tool calls) so the replayed response renders
+    /// cleanly instead of duplicating.
+    #[serde(rename = "retry_rollback")]
+    RetryRollback { attempt: u32, max: u32 },
+
     /// Upstream provider info (e.g., which provider OpenRouter routed to)
     #[serde(rename = "upstream_provider")]
     UpstreamProvider { provider: String },
@@ -1224,6 +1238,21 @@ pub enum ServerEvent {
         message: String,
         /// Whether compaction was started successfully
         success: bool,
+    },
+
+    /// Response to resume_all_sessions — summary of which sessions were continued.
+    #[serde(rename = "resume_all_result")]
+    ResumeAllResult {
+        id: u64,
+        /// Number of live sessions that were continued by this request.
+        resumed: usize,
+        /// Number of live sessions inspected but skipped (idle/complete/busy).
+        skipped: usize,
+        /// Friendly names (or short ids) of the sessions that were continued.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resumed_sessions: Vec<String>,
+        /// Human-readable summary suitable for direct display.
+        message: String,
     },
 
     /// A running command is waiting for stdin input from the user

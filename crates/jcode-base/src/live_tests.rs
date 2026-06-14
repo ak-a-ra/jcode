@@ -13,7 +13,7 @@ const DEFAULT_RETEST_DAYS: i64 = 14;
 const LEDGER_ENV: &str = "JCODE_LIVE_TEST_LEDGER";
 const COVERAGE_ENV: &str = "JCODE_LIVE_TEST_COVERAGE";
 
-pub const CHECKPOINT_TAXONOMY_VERSION: u32 = 2;
+pub const CHECKPOINT_TAXONOMY_VERSION: u32 = 3;
 
 pub mod checkpoints {
     pub const AUTH_UX_KEY_ENTRY: &str = "auth_ux_key_entry";
@@ -30,6 +30,10 @@ pub mod checkpoints {
     pub const TOOL_EXECUTION_LOOP: &str = "tool_execution_loop";
     pub const TOOL_RESULT_FOLLOWUP: &str = "tool_result_followup";
     pub const REAL_JCODE_TOOL_SMOKE: &str = "real_jcode_tool_smoke";
+    /// Observe-only: did the model expose its reasoning (`streamed`), hide it
+    /// behind an opaque signal (`opaque`, e.g. Gemini-3 / OpenAI), or emit none
+    /// (`none`)? Never required for user-readiness; hiding reasoning is a pass.
+    pub const REASONING_CAPABILITY: &str = "reasoning_capability";
     pub const RESTART_PERSISTENCE: &str = "restart_persistence";
     pub const NEGATIVE_ERROR_UX: &str = "negative_error_ux";
     pub const MODEL_CAPABILITY_MATRIX: &str = "model_capability_matrix";
@@ -158,6 +162,16 @@ const END_TO_END_CHECKPOINTS: &[LiveVerificationCheckpointDefinition] = &[
         required_for_user_ready: true,
         spends_balance: true,
         description: "A normal Jcode agent turn uses the real streamed parser, advertised tool schema, registry execution, tool-result followup, and transcript validation without malformed tool calls.",
+    },
+    LiveVerificationCheckpointDefinition {
+        id: checkpoints::REASONING_CAPABILITY,
+        label: "Reasoning capability",
+        category: "reasoning",
+        // Observe-only: a provider that hides its reasoning (opaque) or emits
+        // none is still fully user-ready, so this must never gate readiness.
+        required_for_user_ready: false,
+        spends_balance: true,
+        description: "Records whether the model streams reasoning text, hides it behind an opaque signal (thought_signature/reasoning item/reasoning tokens), or emits none. Passes as long as the reasoning turn completes cleanly; absence of reasoning is recorded, not failed.",
     },
     LiveVerificationCheckpointDefinition {
         id: checkpoints::RESTART_PERSISTENCE,
@@ -577,7 +591,7 @@ impl LiveVerificationEvent {
             statuses.insert(checkpoint.clone(), LiveVerificationStageStatus::NotRun);
         }
         for stage in &self.stages {
-            statuses.insert(stage.name.clone(), stage.status.clone());
+            statuses.insert(stage.name.clone(), stage.status);
         }
         statuses
     }
@@ -779,18 +793,11 @@ impl LiveProviderModelCoveragePair {
             .iter()
             .any(|passed| passed == checkpoint)
         {
-            Some(LiveVerificationStageStatus::Passed)
-        } else if let Some(status) = self.non_passing_checkpoints.get(checkpoint) {
-            Some(status.clone())
-        } else if self
-            .missing_checkpoints
-            .iter()
-            .any(|missing| missing == checkpoint)
-        {
-            None
-        } else {
-            None
+            return Some(LiveVerificationStageStatus::Passed);
         }
+        // Checkpoints listed in `missing_checkpoints` (and anything else
+        // unknown) intentionally fall through to `None`.
+        self.non_passing_checkpoints.get(checkpoint).copied()
     }
 }
 
@@ -867,6 +874,12 @@ pub struct LiveProviderModelCoverageSummary {
 pub struct ProviderMonitorEntry {
     pub provider_id: String,
     pub display_name: String,
+    /// Human label for how this provider authenticates (e.g. "OAuth",
+    /// "API key"). Lets the roster disambiguate sibling providers that share a
+    /// backend but differ by credential path -- e.g. `claude` (OAuth /
+    /// subscription) vs `anthropic-api` (direct API key).
+    #[serde(default)]
+    pub auth_method: String,
     /// True when `jcode provider-doctor <id>` can drive this provider today
     /// (OpenAI-compatible profile exists for the id).
     pub doctor_drivable: bool,
@@ -1169,6 +1182,20 @@ fn provider_test_coverage_icon(status: &LiveVerificationStageStatus) -> &'static
     }
 }
 
+/// Stable lowercase token for a checkpoint verdict, used to build the dedup
+/// signature so two runs recording the same checkpoint ids with different
+/// verdicts hash distinctly. Mirrors the serde representation but is computed
+/// directly so it never depends on `Serialize` formatting.
+fn checkpoint_status_token(status: &LiveVerificationStageStatus) -> &'static str {
+    match status {
+        LiveVerificationStageStatus::Passed => "passed",
+        LiveVerificationStageStatus::Failed => "failed",
+        LiveVerificationStageStatus::Blocked => "blocked",
+        LiveVerificationStageStatus::Skipped => "skipped",
+        LiveVerificationStageStatus::NotRun => "notrun",
+    }
+}
+
 fn provider_test_coverage_checkpoint_label(checkpoint: &str) -> String {
     match checkpoint {
         checkpoints::AUTH_CREDENTIAL_LOADED => "Credential loaded".to_string(),
@@ -1235,7 +1262,7 @@ impl ProviderModelCoverageBuilder {
                     passed_checkpoints.push((*checkpoint).to_string());
                 }
                 Some(status) => {
-                    non_passing_checkpoints.insert((*checkpoint).to_string(), status.clone());
+                    non_passing_checkpoints.insert((*checkpoint).to_string(), *status);
                 }
                 None => missing_checkpoints.push((*checkpoint).to_string()),
             }
@@ -1277,8 +1304,8 @@ fn merge_checkpoint_status(
     }
 
     match current {
-        Some(existing) if rank(existing) >= rank(incoming) => existing.clone(),
-        _ => incoming.clone(),
+        Some(existing) if rank(existing) >= rank(incoming) => *existing,
+        _ => *incoming,
     }
 }
 
@@ -1312,8 +1339,11 @@ pub fn strict_live_provider_model_coverage_summary(
     let mut covered_pairs = Vec::new();
     let mut uncovered_pairs = Vec::new();
     let mut provider_labels = BTreeMap::new();
-    let mut provider_totals: BTreeMap<String, (usize, usize, Vec<String>, usize, usize, usize)> =
-        BTreeMap::new();
+    /// Per-provider rollup accumulated while folding coverage pairs:
+    /// (total pairs, covered pairs, models missing strict coverage,
+    /// basic-chat passes, tool-smoke passes, tool-smoke skips).
+    type ProviderTotals = (usize, usize, Vec<String>, usize, usize, usize);
+    let mut provider_totals: BTreeMap<String, ProviderTotals> = BTreeMap::new();
 
     for pair in builders
         .into_values()
@@ -1435,10 +1465,13 @@ pub fn strict_live_provider_model_coverage_summary(
 fn latest_coverage_entries_by_provider_model_test(
     coverage: &LiveVerificationCoverage,
 ) -> BTreeMap<String, &LiveVerificationCoverageEntry> {
-    let mut latest_by_target_and_checkpoints: BTreeMap<
+    /// Coverage entries keyed by (provider identity, model, test name,
+    /// expected checkpoints), each holding the latest (coverage key, entry).
+    type LatestByTarget<'a> = BTreeMap<
         (String, String, String, Vec<String>),
-        (&String, &LiveVerificationCoverageEntry),
-    > = BTreeMap::new();
+        (&'a String, &'a LiveVerificationCoverageEntry),
+    >;
+    let mut latest_by_target_and_checkpoints: LatestByTarget = BTreeMap::new();
     for (key, entry) in &coverage.latest {
         let provider_identity =
             canonical_live_provider_identity(&entry.provider_id, &entry.provider_label);
@@ -1449,16 +1482,25 @@ fn latest_coverage_entries_by_provider_model_test(
             .filter(|model| !model.is_empty())
             .unwrap_or("*")
             .to_string();
-        let checkpoint_ids = entry
+        // Key on the full checkpoint *status* signature, not just the checkpoint
+        // names. Two runs of the same command can record the identical set of
+        // checkpoint ids with different verdicts -- e.g. a full-tier doctor run
+        // that actually exercises chat/streaming/tool stages (Passed) vs a later
+        // lighter-tier re-run that records those same stages as Skipped. Keying
+        // on names alone would let the newer-but-weaker run evict the older
+        // passing run, hiding real READY evidence before the status-aware merge
+        // in `ProviderModelCoverageBuilder` ever sees it. Including the verdicts
+        // keeps both signatures alive so the merge can promote the best evidence.
+        let checkpoint_signature = entry
             .checkpoint_statuses
-            .keys()
-            .cloned()
+            .iter()
+            .map(|(id, status)| format!("{id}={}", checkpoint_status_token(status)))
             .collect::<Vec<_>>();
         let target_key = (
             provider_identity.0,
             model,
             entry.test_name.clone(),
-            checkpoint_ids,
+            checkpoint_signature,
         );
         let replace = latest_by_target_and_checkpoints
             .get(&target_key)
@@ -1758,6 +1800,7 @@ fn build_provider_roster(providers: &[LiveProviderCoverageSummary]) -> Vec<Provi
         .map(|(provider_id, display_name)| {
             let doctor_drivable = doctor_supports_provider(&provider_id);
             let has_credential = provider_has_credential(&provider_id);
+            let auth_method = provider_auth_method_label(&provider_id);
             let ready_pairs = ready.get(&provider_id).copied().unwrap_or(0);
             let observed_pairs = observed.get(&provider_id).copied().unwrap_or(0);
             let status = if ready_pairs > 0 {
@@ -1775,6 +1818,7 @@ fn build_provider_roster(providers: &[LiveProviderCoverageSummary]) -> Vec<Provi
             ProviderMonitorEntry {
                 provider_id,
                 display_name,
+                auth_method,
                 doctor_drivable,
                 has_credential,
                 ready_pairs,
@@ -1783,6 +1827,22 @@ fn build_provider_roster(providers: &[LiveProviderCoverageSummary]) -> Vec<Provi
             }
         })
         .collect()
+}
+
+/// Human-readable label for how a provider authenticates, used to disambiguate
+/// sibling providers that share a backend but differ by credential path. Falls
+/// back to the login-provider catalog's `auth_kind`, and finally to a generic
+/// "API key" for OpenAI-compatible profiles (which are all key-based).
+fn provider_auth_method_label(provider_id: &str) -> String {
+    if let Some(provider) = crate::provider_catalog::resolve_login_provider(provider_id) {
+        return provider.auth_kind.label().to_string();
+    }
+    if crate::provider_catalog::openai_compatible_profile_by_id(provider_id).is_some() {
+        return crate::provider_catalog::LoginProviderAuthKind::ApiKey
+            .label()
+            .to_string();
+    }
+    String::new()
 }
 
 pub fn format_strict_live_provider_model_coverage_summary(
@@ -1994,31 +2054,47 @@ pub fn format_strict_live_provider_model_coverage_summary(
             .max()
             .unwrap_or(8)
             .max(8);
+        let auth_width = rows
+            .iter()
+            .map(|e| e.auth_method.len())
+            .max()
+            .unwrap_or(4)
+            .max(4);
         out.push_str(&format!(
-            "  {:<id_width$}  {:<18}  {:<7}  {:<4}  {}\n",
+            "  {:<id_width$}  {:<auth_width$}  {:<18}  {:<7}  {:<4}  {}\n",
             "provider",
+            "auth",
             "status",
             "doctor",
             "key",
             "ready/seen pairs",
-            id_width = id_width
+            id_width = id_width,
+            auth_width = auth_width,
         ));
         for entry in rows {
             let doctor = if entry.doctor_drivable { "yes" } else { "no" };
             let key = if entry.has_credential { "yes" } else { "-" };
+            let auth = if entry.auth_method.is_empty() {
+                "-"
+            } else {
+                entry.auth_method.as_str()
+            };
             out.push_str(&format!(
-                "  {:<id_width$}  {:<18}  {:<7}  {:<4}  {}/{}\n",
+                "  {:<id_width$}  {:<auth_width$}  {:<18}  {:<7}  {:<4}  {}/{}\n",
                 entry.provider_id,
+                auth,
                 entry.status,
                 doctor,
                 key,
                 entry.ready_pairs,
                 entry.observed_pairs,
-                id_width = id_width
+                id_width = id_width,
+                auth_width = auth_width,
             ));
         }
         out.push_str(
-            "  Legend: doctor=`provider-doctor` can drive it; key=credential present;\n  \
+            "  Legend: auth=credential path (OAuth/subscription vs direct API key, etc.);\n  \
+             doctor=`provider-doctor` can drive it; key=credential present;\n  \
              ready/seen pairs = READY pairs / pairs seen in the ledger (e.g. 1/3 = 1 of 3 ready).\n\n",
         );
     }
@@ -2224,10 +2300,10 @@ pub fn classify_provider_test_coverage_line(line: &str) -> CoverageLineStyle {
     }
 
     // Per-pair in-progress rows lead with an `N/M` stage count.
-    if let Some(first) = t.split_whitespace().next() {
-        if is_stage_fraction(first) {
-            return if t.contains("failed at") { Fail } else { Warn };
-        }
+    if let Some(first) = t.split_whitespace().next()
+        && is_stage_fraction(first)
+    {
+        return if t.contains("failed at") { Fail } else { Warn };
     }
 
     // Provider-monitor rows end with a `ready/seen` fraction; color by status
@@ -2514,6 +2590,7 @@ mod tests {
             checkpoints::TOOL_EXECUTION_LOOP,
             checkpoints::TOOL_RESULT_FOLLOWUP,
             checkpoints::REAL_JCODE_TOOL_SMOKE,
+            checkpoints::REASONING_CAPABILITY,
             checkpoints::RESTART_PERSISTENCE,
             checkpoints::NEGATIVE_ERROR_UX,
             checkpoints::MODEL_CAPABILITY_MATRIX,
@@ -2526,6 +2603,24 @@ mod tests {
                 .iter()
                 .any(|checkpoint| checkpoint.spends_balance),
             "taxonomy should identify balance-spending checkpoints"
+        );
+
+        // The reasoning_capability checkpoint is observe-only: it records what
+        // the model exposed (streamed/opaque/none) but a provider that hides its
+        // reasoning is still fully user-ready, so it must never gate readiness or
+        // strict coverage.
+        let reasoning = end_to_end_checkpoint_definitions()
+            .iter()
+            .find(|checkpoint| checkpoint.id == checkpoints::REASONING_CAPABILITY)
+            .expect("reasoning_capability checkpoint must exist in the taxonomy");
+        assert!(
+            !reasoning.required_for_user_ready,
+            "reasoning_capability must not be required for user-readiness"
+        );
+        assert!(
+            !STRICT_PROVIDER_MODEL_COVERAGE_CHECKPOINTS
+                .contains(&checkpoints::REASONING_CAPABILITY),
+            "reasoning_capability must not be a strict-required checkpoint"
         );
     }
 
@@ -2611,7 +2706,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         for (checkpoint, status) in overrides {
-            statuses.insert((*checkpoint).to_string(), status.clone());
+            statuses.insert((*checkpoint).to_string(), *status);
         }
         statuses
     }
@@ -2685,6 +2780,99 @@ mod tests {
                 .contains(&"opencode".to_string()),
             "observed providers should not be reported as having no live model evidence"
         );
+    }
+
+    #[test]
+    fn strict_coverage_keeps_passing_run_when_newer_run_skips_same_checkpoints() {
+        // Regression: a full-tier doctor run records the strict checkpoints as
+        // Passed; a later lighter-tier re-run records the *same* checkpoint ids
+        // but with the API-dependent stages Skipped. The newer run must not
+        // evict the older passing evidence during dedup, or the pair silently
+        // drops out of READY even though it genuinely passed everything.
+        let mut passing = coverage_entry(
+            "anthropic-api",
+            "Anthropic API",
+            Some("claude-opus-4-8"),
+            strict_statuses(&[]),
+        );
+        passing.recorded_at = Utc::now() - Duration::hours(2);
+
+        // Newer run: identical checkpoint id set, but API stages skipped.
+        let mut skipped = coverage_entry(
+            "anthropic-api",
+            "Anthropic API",
+            Some("claude-opus-4-8"),
+            strict_statuses(&[
+                (
+                    checkpoints::NON_STREAMING_CHAT_COMPLETION,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+                (
+                    checkpoints::STREAMING_CHAT_COMPLETION,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+                (
+                    checkpoints::TOOL_CALL_PARSE,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+                (
+                    checkpoints::TOOL_EXECUTION_LOOP,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+                (
+                    checkpoints::TOOL_RESULT_FOLLOWUP,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+                (
+                    checkpoints::REAL_JCODE_TOOL_SMOKE,
+                    LiveVerificationStageStatus::Skipped,
+                ),
+            ]),
+        );
+        skipped.recorded_at = Utc::now();
+
+        let mut latest = BTreeMap::new();
+        latest.insert(
+            "anthropic-api::claude-opus-4-8::passing".to_string(),
+            passing,
+        );
+        latest.insert(
+            "anthropic-api::claude-opus-4-8::skipped".to_string(),
+            skipped,
+        );
+        let coverage = LiveVerificationCoverage {
+            schema_version: SCHEMA_VERSION,
+            updated_at: Utc::now(),
+            checkpoint_taxonomy_version: CHECKPOINT_TAXONOMY_VERSION,
+            checkpoint_taxonomy: checkpoint_catalog_metadata(),
+            latest,
+        };
+
+        let summary = strict_live_provider_model_coverage_summary(&coverage, "unit");
+        assert_eq!(
+            summary.covered_provider_model_pairs, 1,
+            "the passing full-tier run must still promote the pair to READY"
+        );
+        assert_eq!(summary.covered_pairs[0].provider_id, "anthropic-api");
+        assert_eq!(summary.covered_pairs[0].model, "claude-opus-4-8");
+
+        // And the monitoring roster reflects it as READY with the OAuth/API-key
+        // auth method recorded (anthropic-api is the direct API-key path).
+        let entry = summary
+            .provider_roster
+            .iter()
+            .find(|e| e.provider_id == "anthropic-api")
+            .expect("anthropic-api should appear in the provider roster");
+        assert_eq!(entry.status, "READY");
+        assert_eq!(entry.auth_method, "API key");
+
+        // The native OAuth Claude provider is labeled distinctly from the API one.
+        let claude = summary
+            .provider_roster
+            .iter()
+            .find(|e| e.provider_id == "claude")
+            .expect("claude should appear in the provider roster");
+        assert_eq!(claude.auth_method, "OAuth");
     }
 
     #[test]
@@ -2862,23 +3050,23 @@ mod tests {
                 Fail,
             ),
             (
-                "  cerebras             READY               yes      yes   1/3",
+                "  cerebras             API key  READY               yes      yes   1/3",
                 Pass,
             ),
             (
-                "  gemini               in progress         no       -     0/3",
+                "  gemini               OAuth    in progress         no       -     0/3",
                 Warn,
             ),
             (
-                "  302ai                no key              yes      -     0/0",
+                "  302ai                API key  no key              yes      -     0/0",
                 Warn,
             ),
             (
-                "  openai-compatible    untested            yes      yes   0/0",
+                "  openai-compatible    API key  untested            yes      yes   0/0",
                 Dim,
             ),
             (
-                "  bedrock              needs native suite  no       -     0/0",
+                "  bedrock              API key  needs native suite  no       -     0/0",
                 Dim,
             ),
             ("  [#223] xiaomi-mimo / mimo-v2.5: READY", Pass),

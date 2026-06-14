@@ -12,6 +12,101 @@ type AmbientInfoCacheEntry = (std::time::Instant, bool, Option<AmbientWidgetData
 
 static AMBIENT_INFO_CACHE: Mutex<Option<AmbientInfoCacheEntry>> = Mutex::new(None);
 
+/// Stale-while-revalidate cache for the git status widget. Module-level so the
+/// app can force a refresh the moment it mutates the repo (commit, shell, file
+/// edits) instead of waiting out the TTL with a stale branch/dirty count.
+type GitInfoCacheEntry = (std::time::Instant, Option<GitInfo>, bool);
+static GIT_INFO_CACHE: Mutex<Option<GitInfoCacheEntry>> = Mutex::new(None);
+
+/// Stale-while-revalidate cache for per-session todos. Module-level so the app
+/// can force a refresh the moment it persists a todo write locally, instead of
+/// showing the previous list until the TTL lapses.
+type TodosCache = std::collections::HashMap<String, (std::time::Instant, Vec<TodoItem>, bool)>;
+static TODOS_CACHE: std::sync::LazyLock<Mutex<TodosCache>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Force the git-status widget cache to refetch on its next read.
+///
+/// Call this right after the app changes the working tree or HEAD (commits,
+/// shell commands, file edits) so the info widget reflects the new repo state
+/// immediately rather than after the 5s TTL. Stale-while-revalidate still
+/// applies: the next read returns the last value and kicks a background refresh.
+pub(crate) fn invalidate_git_info_cache() {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock()
+        && let Some((ts, _cached, refreshing)) = guard.as_mut()
+    {
+        // Backdate the timestamp past the TTL so the next `gather_git_info`
+        // treats the entry as expired and spawns a refresh, while still
+        // returning the last-known value (no flicker to empty).
+        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *refreshing = false;
+    }
+}
+
+/// Force the todos widget cache to refetch the given session on its next read.
+///
+/// Call this right after the app persists a local todo write so the info widget
+/// reflects the new list immediately rather than after the 1s TTL.
+pub(crate) fn invalidate_todos_cache(session_id: &str) {
+    if let Ok(mut cache) = TODOS_CACHE.lock()
+        && let Some((ts, _todos, refreshing)) = cache.get_mut(session_id)
+    {
+        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *refreshing = false;
+    }
+}
+
+/// Force the ambient widget cache to refetch on its next read.
+///
+/// Call this after the app changes ambient state (e.g. the `schedule` tool
+/// queues or cancels a task) so the ambient panel reflects the new queue/next
+/// wake immediately rather than after the 2s TTL.
+pub(crate) fn invalidate_ambient_info_cache() {
+    if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock()
+        && let Some((ts, _enabled, _cached, refreshing)) = guard.as_mut()
+    {
+        *ts = std::time::Instant::now() - Duration::from_secs(3600);
+        *refreshing = false;
+    }
+}
+
+/// Open a file/URL with the system opener, unless suppressed.
+///
+/// Every TUI-initiated `open::that_detached` must go through here: it honors
+/// NO_BROWSER/JCODE_NO_BROWSER and refuses to open anything from test binaries
+/// (`browser_suppressed` detects the test harness), so `cargo test` runs never
+/// pop browser windows, image viewers, or OAuth pages on the developer's
+/// desktop.
+pub(crate) fn open_path_or_url_detached(
+    target: impl AsRef<std::ffi::OsStr>,
+) -> std::io::Result<()> {
+    if crate::auth::browser_suppressed(false) {
+        return Err(std::io::Error::other(
+            "opening files/URLs is suppressed (NO_BROWSER/JCODE_NO_BROWSER or test harness)",
+        ));
+    }
+    open::that_detached(target)
+}
+
+/// Test-only: snapshot `(elapsed_secs, refreshing)` for a session's todos cache
+/// entry, or `None` when no entry exists yet. Lets tests assert that
+/// invalidation backdates the entry so the next gather treats it as expired.
+#[cfg(test)]
+pub(crate) fn todos_cache_entry_age_for_tests(session_id: &str) -> Option<(u64, bool)> {
+    let cache = TODOS_CACHE.lock().ok()?;
+    cache
+        .get(session_id)
+        .map(|(ts, _todos, refreshing)| (ts.elapsed().as_secs(), *refreshing))
+}
+
+/// Test-only: clear the entire todos cache so tests start from a known state.
+#[cfg(test)]
+pub(crate) fn clear_todos_cache_for_tests() {
+    if let Ok(mut cache) = TODOS_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CachedContextSnapshot {
     pub session_key: String,
@@ -181,6 +276,14 @@ pub(super) fn is_context_limit_error(error: &str) -> bool {
         || (lower.contains("exceeded") && lower.contains("tokens"))
 }
 
+/// Whether `error` is a provider HTTP 413 "request too large" / payload-size
+/// rejection. This is distinct from a token-context overflow: it is driven by
+/// the serialized request body size (dominated by inline base64 images), so it
+/// is recovered by stripping oversized images rather than by token compaction.
+pub(super) fn is_request_payload_too_large_error(error: &str) -> bool {
+    crate::compaction::is_request_payload_too_large_error(error)
+}
+
 /// Parse a clock time like "5am" or "12:30pm" and return duration until that time
 pub(super) fn parse_clock_time_to_duration(time_str: &str) -> Option<Duration> {
     let time_lower = time_str.to_lowercase();
@@ -248,7 +351,8 @@ pub(super) fn format_tokens(tokens: u64) -> String {
     }
 }
 
-/// Copy text to clipboard, trying wl-copy first (Wayland), then arboard as fallback.
+/// Copy text to clipboard, trying wl-copy first (Wayland), then OSC 52 (works
+/// over SSH / Docker / tmux), then arboard as a final fallback.
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
     if let Ok(mut child) = std::process::Command::new("wl-copy")
         .stdin(std::process::Stdio::piped())
@@ -261,12 +365,35 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
             && stdin.write_all(text.as_bytes()).is_ok()
         {
             drop(child.stdin.take());
-            return child.wait().map(|s| s.success()).unwrap_or(false);
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
         }
+    }
+    if copy_to_clipboard_osc52(text) {
+        return true;
     }
     arboard::Clipboard::new()
         .and_then(|mut cb| cb.set_text(text.to_string()))
         .is_ok()
+}
+
+/// Copy to clipboard using the OSC 52 terminal escape sequence. This asks the
+/// terminal emulator to set the system clipboard without needing a local
+/// display server, making it work over SSH, inside Docker, and under tmux
+/// (with `set -g set-clipboard on`). Returns false if stdout is not a TTY.
+fn copy_to_clipboard_osc52(text: &str) -> bool {
+    use base64::Engine as _;
+    use std::io::{IsTerminal, Write};
+
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
+        return false;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // OSC 52: ESC ] 52 ; c ; <base64> BEL
+    let seq = format!("\x1b]52;c;{}\x07", encoded);
+    out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
 pub(super) fn effort_display_label(effort: &str) -> &str {
@@ -310,9 +437,8 @@ pub(super) fn pretty_model_display_name(model: &str) -> String {
         // `-<major>-<minor>` version into `<major>.<minor>` and title-case the
         // family/tier words.
         prettify_claude(core)
-    } else if lower.starts_with("gemini-") {
-        title_case_dashed(core)
     } else {
+        // Gemini and everything else: just title-case the dashed segments.
         title_case_dashed(core)
     };
 
@@ -382,6 +508,7 @@ pub(super) fn inferred_reasoning_efforts(
         || model.starts_with("claude-");
     if is_anthropic {
         let supports_effort = model.contains("claude-mythos")
+            || model.contains("claude-fable-5")
             || model.contains("claude-opus-4-8")
             || model.contains("claude-opus-4-7")
             || model.contains("claude-opus-4-6")
@@ -392,7 +519,10 @@ pub(super) fn inferred_reasoning_efforts(
         if !supports_effort {
             return Vec::new();
         }
-        if model.contains("claude-opus-4-8") || model.contains("claude-opus-4-7") {
+        if model.contains("claude-fable-5")
+            || model.contains("claude-opus-4-8")
+            || model.contains("claude-opus-4-7")
+        {
             return vec!["none", "low", "medium", "high", "xhigh"];
         }
         return vec!["none", "low", "medium", "high"];
@@ -845,14 +975,11 @@ pub(super) fn encode_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> Op
 }
 
 pub(super) fn gather_git_info() -> Option<GitInfo> {
-    use std::sync::Mutex;
     use std::time::Instant;
-
-    static CACHE: Mutex<Option<(Instant, Option<GitInfo>, bool)>> = Mutex::new(None);
 
     const TTL: Duration = Duration::from_secs(5);
 
-    if let Ok(mut guard) = CACHE.lock() {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         if let Some((ts, cached, refreshing)) = guard.as_mut() {
             if ts.elapsed() < TTL {
                 return cached.clone();
@@ -864,7 +991,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
             *refreshing = true;
             std::thread::spawn(|| {
                 let result = gather_git_info_inner();
-                if let Ok(mut guard) = CACHE.lock() {
+                if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                     *guard = Some((Instant::now(), result, false));
                 }
             });
@@ -874,7 +1001,7 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
         *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
         std::thread::spawn(|| {
             let result = gather_git_info_inner();
-            if let Ok(mut guard) = CACHE.lock() {
+            if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
                 *guard = Some((Instant::now(), result, false));
             }
         });
@@ -883,20 +1010,15 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
 }
 
 pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
     use std::time::Instant;
 
-    type TodosCache = HashMap<String, (Instant, Vec<TodoItem>, bool)>;
-
-    static CACHE: LazyLock<Mutex<TodosCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     const TTL: Duration = Duration::from_secs(1);
 
     let Some(session_id) = session_id else {
         return Vec::new();
     };
 
-    if let Ok(mut cache) = CACHE.lock() {
+    if let Ok(mut cache) = TODOS_CACHE.lock() {
         if let Some((ts, todos, refreshing)) = cache.get_mut(session_id) {
             if ts.elapsed() < TTL {
                 return todos.clone();
@@ -909,7 +1031,7 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
             let session_id = session_id.to_string();
             std::thread::spawn(move || {
                 let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
-                if let Ok(mut cache) = CACHE.lock() {
+                if let Ok(mut cache) = TODOS_CACHE.lock() {
                     cache.insert(session_id, (Instant::now(), todos, false));
                 }
             });
@@ -927,7 +1049,7 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
         );
         std::thread::spawn(move || {
             let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
-            if let Ok(mut cache) = CACHE.lock() {
+            if let Ok(mut cache) = TODOS_CACHE.lock() {
                 cache.insert(session_id, (Instant::now(), todos, false));
             }
         });

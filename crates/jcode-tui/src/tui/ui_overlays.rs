@@ -168,6 +168,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Show loaded skills and jcode-endorsed recommendations",
     ));
     lines.push(help_entry("/info", "Show session info and token usage"));
+    lines.push(help_entry(
+        "/keys",
+        "Show keybinding conflicts with your terminal/OS",
+    ));
     lines.push(help_entry("/usage", "Show connected provider usage limits"));
     lines.push(help_entry("/version", "Show version and build details"));
     lines.push(help_entry(
@@ -313,6 +317,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     if app.is_remote_mode() {
         lines.push(help_entry("/client-reload", "Force reload client binary"));
         lines.push(help_entry("/server-reload", "Force reload server binary"));
+        lines.push(help_entry(
+            "/continue",
+            "Continue every interrupted live session that would auto-resume",
+        ));
     }
     lines.push(help_entry(
         "/debug-visual",
@@ -366,6 +374,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Toggle side panel (or diagram pane if empty)",
     ));
     lines.push(key_entry("Alt+T", "Toggle diagram position (side/top)"));
+    lines.push(key_entry(
+        "Alt+Shift+I",
+        "Show/hide inline images (persists)",
+    ));
     lines.push(key_entry("Ctrl+H / Ctrl+L", "Focus chat / diagram / diffs"));
     lines.push(key_entry(
         "Ctrl+Left / Right",

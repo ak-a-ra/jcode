@@ -2,33 +2,8 @@
 
 Cloudflare Worker that receives anonymous telemetry events from jcode.
 
-## Dashboard
-
-The worker also serves a visual dashboard so you do not have to run SQL by hand:
-
-- `GET /` (or `/dashboard`) - the HTML dashboard. Public page, no data until a
-  token is entered.
-- `GET /v1/stats` - JSON aggregates (counts only, never raw event rows), gated
-  behind `DASHBOARD_TOKEN`. Accepts `Authorization: Bearer <token>`,
-  `?token=<token>`, or `X-Dashboard-Token`.
-- `POST /v1/event` - unchanged event ingest.
-
 The headline number is **Total users**: distinct, non-CI `telemetry_id`s that
-ever installed jcode OR did meaningful work in it. The page shows every metric
-the API returns, organized into tiers (hero / key cards / diagnostic tables) so
-the important numbers stand out while nothing is hidden. Each user tier (reached
-> total > core) is broader than the one below it, and CI / raw figures are shown
-alongside for transparency.
-
-Set the token once (it is a Worker secret, not in source):
-
-```bash
-wrangler secret put DASHBOARD_TOKEN
-# then open https://<your-worker-domain>/ and paste the token
-```
-
-If `DASHBOARD_TOKEN` is unset the stats endpoint stays locked (deny by default).
-The CLI equivalent of the headline number:
+ever installed jcode OR did meaningful work in it. Run it with:
 
 ```bash
 wrangler d1 execute jcode-telemetry --remote --file=users.sql
@@ -198,6 +173,8 @@ wrangler d1 execute jcode-telemetry --command "SELECT AVG(first_assistant_respon
 - Use `meaningful_release_active` for headline product usage. It excludes local/dev/git-checkout traffic and open/close sessions with no meaningful lifecycle activity.
 - For the cleanest headline numbers, prefer the `*_noci` columns, which additionally exclude `is_ci = 1` traffic. Ephemeral CI runners mint a fresh `telemetry_id` per job, so unfiltered they look like brand-new users and installs, inflating active-user/install counts and depressing retention. The client also skips the `install` event under CI, so historical CI installs (before that ships) are the main residual source; the rollup's `last_is_ci` flag lets dashboards filter the rest. Raw events stay tagged (not dropped) so CI crash/error signal is still queryable.
 - Meaningful activity is derived from `session_end`/`session_crash` **and** `turn_end` events. A `turn_end` only fires after a real user turn completes, so counting it keeps the metric accurate for users whose `session_end` is lost (process killed, machine shutdown, dropped final flush, or a session still open at UTC midnight).
-- Raw events remain the source of truth. The `daily_active_users` table is an ingest-time rollup for cheap dashboard queries and is backfillable from `events`.
+- **Retention pruning**: D1 hard-caps databases at 500 MB. When the cap is hit, every insert fails with HTTP 500 and telemetry silently stops being recorded (this happened in June 2026; ~3 days of events were lost). The worker now runs a nightly cron (`scheduled` handler, see `RETENTION_DAYS` in `src/worker.js`) that prunes high-volume raw rows: `turn_end`/`session_start`/`onboarding_step` after 30 days, `upgrade` after 60, `auth_success` after 180, `session_end`/`session_crash` after 365. `install` and `feedback` rows are never pruned. Because of this, **historical user/DAU queries must read `daily_active_users`, not raw `events`** - the rollup is backfilled across full history (migration 0014) and maintained at insert time.
+- **D1 100-column cap**: production `events` has 96 columns and D1 refuses `ALTER TABLE ADD COLUMN` past 100 (`too many columns`). Migration 0005's per-turn/session-cadence columns never applied to production `events`; migration 0013 moved those fields into `turn_details`/`session_details`, and the worker writes them there. Do not add new columns to `events`; add them to the detail tables.
+- Raw events remain the source of truth within their retention windows. The `daily_active_users` table is an ingest-time rollup for cheap dashboard queries and is the durable record beyond those windows.
 - The worker uses `INSERT OR IGNORE` keyed by `event_id`; rollups and detail rows are updated only when the canonical raw event insert succeeds, so client retries do not inflate counts.
 - Telemetry still undercounts users who opt out (`JCODE_NO_TELEMETRY`, `DO_NOT_TRACK`, `~/.jcode/no_telemetry`) or whose network blocks telemetry, and may overcount one person using multiple machines.

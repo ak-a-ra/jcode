@@ -36,7 +36,7 @@ fn onboarding_can_begin_at_login_phase() {
     app.begin_onboarding_flow_at_login();
     assert!(matches!(
         app.onboarding_phase(),
-        Some(OnboardingPhase::Login { .. })
+        Some(OnboardingPhase::Login { .. }) | Some(OnboardingPhase::LoginOpenAi { .. })
     ));
     // begin_at_login is idempotent: a second call does not reset the phase.
     if let Some(flow) = app.onboarding_flow.as_mut() {
@@ -123,120 +123,100 @@ fn import_review_highlight_navigation() {
 }
 
 #[test]
-fn login_phase_advances_to_telemetry_consent_then_model_select() {
+fn login_phase_advances_to_model_select_without_telemetry_prompt() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         app.onboarding_flow = None;
+        // Force the bare Login phase (the recovery/import path) so we exercise
+        // onboarding_after_login directly regardless of host logins.
         app.begin_onboarding_flow_at_login();
+        if let Some(flow) = app.onboarding_flow.as_mut() {
+            flow.phase = OnboardingPhase::Login { import: None };
+        }
         assert!(matches!(
             app.onboarding_phase(),
             Some(OnboardingPhase::Login { .. })
         ));
-        // After login we ask for telemetry consent first.
+        // After login we no longer ask a telemetry-consent question; we advance
+        // straight to model selection and leave content sharing off.
         app.onboarding_after_login();
         assert!(matches!(
             app.onboarding_phase(),
-            Some(OnboardingPhase::TelemetryConsent {
-                yes_highlighted: false,
-                ..
+            Some(OnboardingPhase::ModelSelect) | Some(OnboardingPhase::Suggestions)
+        ));
+        assert!(!crate::telemetry::content_sharing_enabled());
+    });
+}
+
+#[test]
+fn login_openai_phase_is_default_when_no_imports() {
+    use crate::tui::OnboardingWelcomeKind;
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.onboarding_flow = None;
+        // Fresh temp home has no importable logins, so begin_at_login lands on
+        // the "Log in to OpenAI?" Yes/No prompt (not the bare provider picker).
+        app.begin_onboarding_flow_at_login();
+        assert!(matches!(
+            app.onboarding_phase(),
+            Some(OnboardingPhase::LoginOpenAi {
+                yes_highlighted: true
             })
         ));
-        // onboarding_after_login is a no-op once we're past the Login phase.
-        app.onboarding_after_login();
         assert!(matches!(
-            app.onboarding_phase(),
-            Some(OnboardingPhase::TelemetryConsent { .. })
+            app.onboarding_welcome_kind(),
+            OnboardingWelcomeKind::LoginOpenAi {
+                yes_highlighted: true
+            }
         ));
-        // Declining advances to model select and does not opt in.
-        app.onboarding_answer_telemetry_consent(false);
-        assert!(matches!(
-            app.onboarding_phase(),
-            Some(OnboardingPhase::ModelSelect)
-        ));
-        assert!(!crate::telemetry::content_sharing_enabled());
     });
 }
 
 #[test]
-fn telemetry_consent_opt_in_persists_and_advances() {
+fn login_openai_no_opens_provider_picker() {
     with_temp_jcode_home(|| {
-        // Ensure base telemetry isn't globally disabled in the test env, so the
-        // content-sharing opt-in is observable.
-        let saved = (
-            std::env::var_os("JCODE_NO_TELEMETRY"),
-            std::env::var_os("DO_NOT_TRACK"),
-        );
-        crate::env::remove_var("JCODE_NO_TELEMETRY");
-        crate::env::remove_var("DO_NOT_TRACK");
-
         let mut app = create_test_app();
         app.onboarding_flow = None;
         app.begin_onboarding_flow_at_login();
         if let Some(flow) = app.onboarding_flow.as_mut() {
-            flow.phase = OnboardingPhase::TelemetryConsent {
-                yes_highlighted: false,
-                shown_at: std::time::Instant::now(),
-            };
-        }
-        // Right highlights Yes, Enter commits -> opt in.
-        assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Right));
-        assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Enter));
-        assert!(matches!(
-            app.onboarding_phase(),
-            Some(OnboardingPhase::ModelSelect)
-        ));
-        assert!(crate::telemetry::content_sharing_enabled());
-        // Re-running the flow and declining clears the opt-in.
-        if let Some(flow) = app.onboarding_flow.as_mut() {
-            flow.phase = OnboardingPhase::TelemetryConsent {
+            flow.phase = OnboardingPhase::LoginOpenAi {
                 yes_highlighted: true,
-                shown_at: std::time::Instant::now(),
             };
         }
+        assert!(app.inline_interactive_state.is_none());
+        // 'n' opens the full provider picker so the user can choose another.
         assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Char('n')));
-        assert!(!crate::telemetry::content_sharing_enabled());
-
-        if let Some(v) = saved.0 {
-            crate::env::set_var("JCODE_NO_TELEMETRY", v);
-        }
-        if let Some(v) = saved.1 {
-            crate::env::set_var("DO_NOT_TRACK", v);
-        }
+        assert!(app.inline_interactive_state.is_some());
     });
 }
 
 #[test]
-fn telemetry_consent_y_key_opts_in() {
+fn login_openai_arrows_toggle_highlight() {
     with_temp_jcode_home(|| {
-        let saved = (
-            std::env::var_os("JCODE_NO_TELEMETRY"),
-            std::env::var_os("DO_NOT_TRACK"),
-        );
-        crate::env::remove_var("JCODE_NO_TELEMETRY");
-        crate::env::remove_var("DO_NOT_TRACK");
-
         let mut app = create_test_app();
         app.onboarding_flow = None;
         app.begin_onboarding_flow_at_login();
         if let Some(flow) = app.onboarding_flow.as_mut() {
-            flow.phase = OnboardingPhase::TelemetryConsent {
-                yes_highlighted: false,
-                shown_at: std::time::Instant::now(),
+            flow.phase = OnboardingPhase::LoginOpenAi {
+                yes_highlighted: true,
             };
         }
-        assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Char('y')));
-        assert!(crate::telemetry::content_sharing_enabled());
+        // Right highlights No, Left highlights Yes; nothing commits yet.
+        assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Right));
         assert!(matches!(
             app.onboarding_phase(),
-            Some(OnboardingPhase::ModelSelect)
+            Some(OnboardingPhase::LoginOpenAi {
+                yes_highlighted: false
+            })
         ));
-
-        if let Some(v) = saved.0 {
-            crate::env::set_var("JCODE_NO_TELEMETRY", v);
-        }
-        if let Some(v) = saved.1 {
-            crate::env::set_var("DO_NOT_TRACK", v);
-        }
+        assert!(app.handle_onboarding_continue_prompt_key(KeyCode::Left));
+        assert!(matches!(
+            app.onboarding_phase(),
+            Some(OnboardingPhase::LoginOpenAi {
+                yes_highlighted: true
+            })
+        ));
+        assert!(app.inline_interactive_state.is_none());
     });
 }
 
@@ -411,7 +391,7 @@ fn no_external_transcripts_lands_on_suggestions_without_autosubmit() {
         // Temp home has no Codex transcripts, so opening the picker should land
         // the user on the clean new-session suggestion cards rather than
         // auto-submitting a "search for my last session" turn.
-        app.onboarding_open_transcript_picker(ExternalCli::Codex);
+        app.onboarding_open_transcript_picker(&[ExternalCli::Codex]);
         assert!(matches!(
             app.onboarding_phase(),
             Some(OnboardingPhase::Suggestions)
@@ -430,6 +410,72 @@ fn onboarding_picker_mode_carries_cli() {
     };
     assert!(matches!(mode, SessionPickerMode::Onboarding { .. }));
     assert_ne!(mode, SessionPickerMode::Resume);
+}
+
+#[test]
+fn onboarding_picker_shows_both_codex_and_claude_transcripts() {
+    use std::fs;
+    with_temp_jcode_home(|| {
+        // Seed one Codex transcript and one Claude Code transcript under the
+        // sandbox-aware external home ($JCODE_HOME/external/...), mirroring a
+        // user who is logged into BOTH CLIs.
+        let home = std::env::var_os("JCODE_HOME").expect("JCODE_HOME");
+        let external = std::path::Path::new(&home).join("external");
+
+        let codex_dir = external.join(".codex/sessions/2026/04/05");
+        fs::create_dir_all(&codex_dir).expect("codex dir");
+        fs::write(
+            codex_dir.join("rollout-2026-04-05T19-00-00-codextest.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-04-05T19:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019d-codex-both\",\"timestamp\":\"2026-04-05T18:59:00Z\",\"cwd\":\"/tmp/codex-demo\",\"source\":\"cli\"}}\n",
+                "{\"timestamp\":\"2026-04-05T19:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"CODEX_MARKER fix the widget\"}]}}\n",
+            ),
+        )
+        .expect("write codex transcript");
+
+        let claude_dir = external.join(".claude/projects/demo-project");
+        fs::create_dir_all(&claude_dir).expect("claude dir");
+        fs::write(
+            claude_dir.join("claude-session-both.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"CLAUDE_MARKER fix the flaky test\"}]}}\n",
+                "{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n"
+            ),
+        )
+        .expect("write claude transcript");
+
+        let mut app = onboarding_test_app();
+        // Open the combined picker for BOTH detected CLIs.
+        app.onboarding_open_transcript_picker(&[ExternalCli::Codex, ExternalCli::ClaudeCode]);
+
+        // The picker overlay should be up with both CLIs' sessions visible
+        // (not just one).
+        let picker_cell = app
+            .session_picker_overlay
+            .as_ref()
+            .expect("picker overlay should be open");
+        let picker = picker_cell.borrow();
+        assert!(
+            picker.visible_session_count() >= 2,
+            "combined picker should list both CLIs' sessions, got {}",
+            picker.visible_session_count()
+        );
+
+        let mut saw_codex = false;
+        let mut saw_claude = false;
+        for session in picker.visible_session_iter_for_test() {
+            match session.source {
+                jcode_tui_session_picker::SessionSource::Codex => saw_codex = true,
+                jcode_tui_session_picker::SessionSource::ClaudeCode => saw_claude = true,
+                _ => {}
+            }
+        }
+        assert!(saw_codex, "Codex session should be present in combined picker");
+        assert!(
+            saw_claude,
+            "Claude Code session should be present in combined picker"
+        );
+    });
 }
 
 #[test]
@@ -474,7 +520,7 @@ fn startup_check_ignores_synthetic_scaffolding_messages() {
         assert!(app.onboarding_startup_checked);
         assert!(matches!(
             app.onboarding_phase(),
-            Some(OnboardingPhase::Login { .. })
+            Some(OnboardingPhase::Login { .. }) | Some(OnboardingPhase::LoginOpenAi { .. })
         ));
     });
 }
@@ -505,6 +551,27 @@ fn startup_check_is_noop_once_committed() {
 
         // Already committed: never touches the flow.
         assert!(app.onboarding_flow.is_none());
+    });
+}
+
+#[test]
+fn startup_check_skips_selfdev_canary_session() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.onboarding_flow = None;
+        app.onboarding_startup_checked = false;
+        // Self-dev / canary sessions (e.g. the niri `jcode self-dev` hotkey) take
+        // a launch path that never bumps `launch_count`, so without this guard the
+        // new-user heuristic would re-onboard on every spawn.
+        app.session.is_canary = true;
+
+        app.maybe_begin_onboarding_flow_on_startup();
+
+        assert!(app.onboarding_startup_checked);
+        assert!(
+            app.onboarding_flow.is_none(),
+            "self-dev/canary sessions must never auto-start onboarding"
+        );
     });
 }
 
@@ -615,4 +682,91 @@ fn model_validation_ignores_stale_session_result() {
         before,
         "stale result appends nothing"
     );
+}
+
+#[test]
+fn remote_post_login_validation_waits_for_catalog_refresh() {
+    use crate::tui::app::onboarding_flow::OnboardingPendingValidation;
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.is_remote = true;
+        // Simulate the state right after a remote login: a pending validation
+        // armed to wait for the catalog generation to advance past 3.
+        app.remote_model_catalog_generation = 3;
+        app.onboarding_pending_model_validation = Some(
+            OnboardingPendingValidation::awaiting_catalog_refresh(app.session.id.clone(), 3),
+        );
+
+        // Catalog hasn't refreshed yet (generation unchanged): not ready to fire.
+        assert!(!app.onboarding_pending_validation_ready_to_fire());
+
+        // The server pushes the post-login catalog (generation advances): now
+        // the validation is ready to fire with the freshly-selected model.
+        app.remote_model_catalog_generation = 4;
+        assert!(app.onboarding_pending_validation_ready_to_fire());
+    });
+}
+
+#[test]
+fn startup_check_skips_user_with_established_session_history() {
+    with_temp_jcode_home(|| {
+        // A low/missing launch_count alone must NOT classify someone as a new
+        // user when their jcode home has a substantial native session history
+        // (e.g. setup_hints.json was reset or lost). Seed >=10 native session
+        // files in the temp home.
+        let sessions_dir = crate::storage::jcode_dir()
+            .expect("jcode dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        for i in 0..10 {
+            std::fs::write(
+                sessions_dir.join(format!("session_test_{i:02}.json")),
+                "{}",
+            )
+            .expect("write session file");
+        }
+
+        let mut app = create_test_app();
+        app.onboarding_flow = None;
+        app.onboarding_startup_checked = false;
+
+        app.maybe_begin_onboarding_flow_on_startup();
+
+        assert!(app.onboarding_startup_checked);
+        assert!(
+            app.onboarding_flow.is_none(),
+            "established users (many native sessions) must never re-onboard"
+        );
+    });
+}
+
+#[test]
+fn startup_check_imported_transcripts_do_not_count_as_history() {
+    with_temp_jcode_home(|| {
+        // Imported Codex/Claude transcripts exist on genuinely fresh installs
+        // that chose to import history; they must not suppress onboarding.
+        let sessions_dir = crate::storage::jcode_dir()
+            .expect("jcode dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        for i in 0..20 {
+            std::fs::write(
+                sessions_dir.join(format!("imported_codex_{i:02}.json")),
+                "{}",
+            )
+            .expect("write imported file");
+        }
+
+        let mut app = create_test_app();
+        app.onboarding_flow = None;
+        app.onboarding_startup_checked = false;
+
+        app.maybe_begin_onboarding_flow_on_startup();
+
+        assert!(app.onboarding_startup_checked);
+        assert!(
+            app.onboarding_flow.is_some(),
+            "imported transcripts alone should still onboard a fresh install"
+        );
+    });
 }

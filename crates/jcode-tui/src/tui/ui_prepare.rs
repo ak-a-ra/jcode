@@ -201,6 +201,66 @@ fn is_error_copy_content(content: &str) -> bool {
     trimmed.starts_with("Error:") || trimmed.starts_with("error:") || trimmed.starts_with("Failed:")
 }
 
+/// Build the image regions for an image/mermaid placeholder in `wrapped_lines`,
+/// where each placeholder "owns" the run of blank lines that follow it.
+///
+/// Done in a single reverse pass that precomputes, for every line, the length
+/// of the blank run starting at that line. The previous implementation scanned
+/// forward through the trailing blanks for every placeholder, which is O(L^2)
+/// when a message has many placeholders each followed by long blank runs.
+fn compute_image_regions(wrapped_lines: &[ratatui::text::Line<'static>]) -> Vec<ImageRegion> {
+    fn is_blank_line(line: &ratatui::text::Line<'static>) -> bool {
+        line.spans.is_empty() || (line.spans.len() == 1 && line.spans[0].content.is_empty())
+    }
+
+    let len = wrapped_lines.len();
+    // blank_run[i] = number of consecutive blank lines starting at index i.
+    let mut blank_run = vec![0usize; len + 1];
+    for idx in (0..len).rev() {
+        blank_run[idx] = if is_blank_line(&wrapped_lines[idx]) {
+            blank_run[idx + 1] + 1
+        } else {
+            0
+        };
+    }
+
+    let mut image_regions = Vec::new();
+    for (idx, line) in wrapped_lines.iter().enumerate() {
+        if let Some(hash) = super::super::mermaid::parse_image_placeholder(line) {
+            // The placeholder line plus the blank run immediately after it.
+            let height = (1 + blank_run[idx + 1]).min(u16::MAX as usize) as u16;
+            image_regions.push(ImageRegion {
+                abs_line_idx: idx,
+                end_line: idx + height as usize,
+                hash,
+                height,
+                // Mermaid crop regions don't know their rendered width here;
+                // 0 = treat the rows as fully occupied for layout purposes.
+                width: 0,
+                render: jcode_tui_messages::ImageRegionRender::Crop,
+            });
+        } else if let Some((hash, rows, cols)) =
+            super::super::mermaid::parse_inline_image_placeholder(line)
+        {
+            // Inline raster image anchored in the transcript body. The marker
+            // encodes its exact geometry; clamp to the blank run that actually
+            // follows so a wrapped/truncated placeholder can never claim
+            // non-blank lines below it.
+            let available = (1 + blank_run[idx + 1]).min(u16::MAX as usize) as u16;
+            let height = rows.max(1).min(available);
+            image_regions.push(ImageRegion {
+                abs_line_idx: idx,
+                end_line: idx + height as usize,
+                hash,
+                height,
+                width: cols,
+                render: jcode_tui_messages::ImageRegionRender::Fit,
+            });
+        }
+    }
+    image_regions
+}
+
 fn error_copy_target(content: &str, rendered_line_count: usize) -> Option<RawCopyTarget> {
     copy_target_for_kind(CopyTargetKind::Error, content, rendered_line_count)
 }
@@ -476,6 +536,8 @@ pub(super) fn prepare_messages(
         streaming_text_len: app.streaming_text().len(),
         streaming_text_hash: super::hash_text_for_cache(app.streaming_text()),
         batch_progress_hash: active_batch_progress_hash(app),
+        inline_images_signature: app.side_pane_images_signature(),
+        inline_images_visible: app.inline_images_visible(),
     };
 
     super::note_full_prep_request();
@@ -525,6 +587,28 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     let body_prepared = prepare_body_cached(app, width);
     let body_ms = body_start.elapsed().as_secs_f64() * 1000.0;
 
+    // Anchored images render inside the body at their producing message; only
+    // images without a resolvable anchor target fall back to this trailing
+    // inline section so nothing silently disappears.
+    let inline_images_prepared = if app.pin_images() {
+        let anchored = super::inline_image_ui::resolve_anchored_items_cached(app);
+        let items = anchored.unplaced_items(app.display_messages());
+        if items.is_empty() {
+            Arc::new(empty_prepared_messages())
+        } else {
+            let prefix_blank = !body_prepared.wrapped_lines.is_empty();
+            Arc::new(super::inline_image_ui::build_section(
+                &items,
+                width,
+                height,
+                prefix_blank,
+                app.inline_images_visible(),
+            ))
+        }
+    } else {
+        Arc::new(empty_prepared_messages())
+    };
+
     let batch_start = Instant::now();
     let has_batch_progress = active_batch_progress(app).is_some();
     let batch_prefix_blank = has_batch_progress && !body_prepared.wrapped_lines.is_empty();
@@ -540,10 +624,14 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
 
     let streaming_start = Instant::now();
+    // Reasoning traces in `current` mode are anchored display messages inside
+    // the body now; no separate retained/collapsing trace section exists.
+    let reasoning_prepared = Arc::new(empty_prepared_messages());
     let has_streaming = app.is_processing() && !app.streaming_text().is_empty();
     let stream_prefix_blank = has_streaming
         && (!body_prepared.wrapped_lines.is_empty()
-            || !batch_progress_prepared.wrapped_lines.is_empty());
+            || !batch_progress_prepared.wrapped_lines.is_empty()
+            || !reasoning_prepared.wrapped_lines.is_empty());
     let streaming_prepared = if has_streaming {
         Arc::new(prepare_streaming_cached(app, width, stream_prefix_blank))
     } else {
@@ -653,7 +741,9 @@ fn prepare_messages_inner(app: &dyn TuiState, width: u16, height: u16) -> Prepar
     let frame = PreparedChatFrame::from_sections(vec![
         (PreparedSectionKind::Header, header_prepared),
         (PreparedSectionKind::Body, body_prepared),
+        (PreparedSectionKind::InlineImages, inline_images_prepared),
         (PreparedSectionKind::BatchProgress, batch_progress_prepared),
+        (PreparedSectionKind::Reasoning, reasoning_prepared),
         (PreparedSectionKind::Streaming, streaming_prepared),
     ]);
     super::note_full_prep_phase_metrics(super::FullPrepPhaseMetrics {
@@ -679,6 +769,9 @@ fn prepare_body_cached(app: &dyn TuiState, width: u16) -> Arc<PreparedMessages> 
         messages_version: app.display_messages_version(),
         diagram_mode: app.diagram_mode(),
         centered: app.centered_mode(),
+        pin_images: app.pin_images(),
+        inline_images_visible: app.inline_images_visible(),
+        images_signature: app.side_pane_images_signature(),
     };
     let msg_count = app.display_messages().len();
     let cache_lookup_start = Instant::now();
@@ -751,10 +844,31 @@ pub(super) fn prepare_body_incremental(
     let pending_count = input_ui::pending_prompt_count(app);
     let prompt_number_offset = app.compacted_hidden_user_prompts();
 
-    let mut prompt_num = messages[..prev_msg_count]
-        .iter()
-        .filter(|m| m.effective_role() == "user")
-        .count();
+    // The number of user prompts already rendered equals the number of cached
+    // user prompt texts. Re-counting `messages[..prev_msg_count]` here on every
+    // incremental append rescans the whole prior transcript, making a session
+    // that grows one message at a time O(n^2). `prev.user_prompt_texts` is
+    // extended in lockstep with each rendered user message, so its length is the
+    // exact prior prompt count.
+    let mut prompt_num = prev.user_prompt_texts.len();
+
+    // Images anchored to transcript messages render inline right after the
+    // message that produced them. An incremental base is only reused when the
+    // image set is unchanged (cache key includes the image signature), so any
+    // anchored image matching a *new* message must be injected here; its anchor
+    // target did not exist when the base was built.
+    let anchored_images = super::inline_image_ui::resolve_anchored_items_cached(app);
+    let inline_images_visible = app.inline_images_visible();
+    // 0-based ordinal of the next rendered user prompt, excluding synthetic
+    // attached-image label messages, mirroring the session renderer's count.
+    let mut anchor_prompt_ordinal = if anchored_images.by_prompt.is_empty() {
+        0
+    } else {
+        prev.user_prompt_texts
+            .iter()
+            .filter(|text| !crate::session::is_attached_image_label_text(text))
+            .count()
+    };
 
     let mut new_lines: Vec<Line> = Vec::new();
     let mut new_user_line_indices: Vec<usize> = Vec::new();
@@ -806,6 +920,21 @@ pub(super) fn prepare_body_incremental(
                     end_col: prompt_width,
                 }));
                 new_line_copy_offsets.push(prefix_width);
+                if !crate::session::is_attached_image_label_text(&msg.content) {
+                    let ordinal = anchor_prompt_ordinal;
+                    anchor_prompt_ordinal += 1;
+                    if let Some(items) = anchored_images.by_prompt.get(&ordinal) {
+                        for line in super::inline_image_ui::anchored_image_lines(
+                            items,
+                            width,
+                            inline_images_visible,
+                        ) {
+                            new_lines.push(line);
+                            new_line_raw_overrides.push(None);
+                            new_line_copy_offsets.push(0);
+                        }
+                    }
+                }
             }
             "assistant" => {
                 let content_width = width.saturating_sub(4);
@@ -899,6 +1028,17 @@ pub(super) fn prepare_body_incremental(
                             expandable,
                         ));
                     }
+                    if let Some(items) = anchored_images.by_tool.get(&tc.id) {
+                        for line in super::inline_image_ui::anchored_image_lines(
+                            items,
+                            width,
+                            inline_images_visible,
+                        ) {
+                            new_lines.push(line);
+                            new_line_raw_overrides.push(None);
+                            new_line_copy_offsets.push(0);
+                        }
+                    }
                 }
             }
             "system" => {
@@ -908,6 +1048,20 @@ pub(super) fn prepare_body_incremental(
                     content_width,
                     app.diff_mode(),
                     render_system_message,
+                );
+                for line in cached {
+                    new_lines.push(align_if_unset(line, align));
+                    new_line_raw_overrides.push(None);
+                    new_line_copy_offsets.push(0);
+                }
+            }
+            "reasoning" => {
+                let content_width = width.saturating_sub(4);
+                let cached = get_cached_message_lines(
+                    msg,
+                    content_width,
+                    app.diff_mode(),
+                    render_reasoning_message,
                 );
                 for line in cached {
                     new_lines.push(align_if_unset(line, align));
@@ -1219,6 +1373,12 @@ pub(super) fn prepare_body(
     let total_prompts = app.display_user_message_count();
     let pending_count = input_ui::pending_prompt_count(app);
 
+    // Images anchored to transcript messages render inline right after the
+    // message that produced them (tool result or user prompt).
+    let anchored_images = super::inline_image_ui::resolve_anchored_items_cached(app);
+    let inline_images_visible = app.inline_images_visible();
+    let mut anchor_prompt_ordinal = 0usize;
+
     for (msg_idx, msg) in app.display_messages().iter().enumerate() {
         let role = msg.effective_role();
         let align = default_message_alignment(role, centered);
@@ -1246,6 +1406,21 @@ pub(super) fn prepare_body(
                     &msg.content,
                     align,
                 );
+                if !crate::session::is_attached_image_label_text(&msg.content) {
+                    let ordinal = anchor_prompt_ordinal;
+                    anchor_prompt_ordinal += 1;
+                    if let Some(items) = anchored_images.by_prompt.get(&ordinal) {
+                        for line in super::inline_image_ui::anchored_image_lines(
+                            items,
+                            width,
+                            inline_images_visible,
+                        ) {
+                            lines.push(line);
+                            line_raw_overrides.push(None);
+                            line_copy_offsets.push(0);
+                        }
+                    }
+                }
             }
             "assistant" => {
                 let content_width = width.saturating_sub(4);
@@ -1369,6 +1544,17 @@ pub(super) fn prepare_body(
                             expandable,
                         ));
                     }
+                    if let Some(items) = anchored_images.by_tool.get(&tc.id) {
+                        for line in super::inline_image_ui::anchored_image_lines(
+                            items,
+                            width,
+                            inline_images_visible,
+                        ) {
+                            lines.push(line);
+                            line_raw_overrides.push(None);
+                            line_copy_offsets.push(0);
+                        }
+                    }
                 }
             }
             "system" => {
@@ -1378,6 +1564,20 @@ pub(super) fn prepare_body(
                     content_width,
                     app.diff_mode(),
                     render_system_message,
+                );
+                for line in cached {
+                    lines.push(align_if_unset(line, align));
+                    line_raw_overrides.push(None);
+                    line_copy_offsets.push(0);
+                }
+            }
+            "reasoning" => {
+                let content_width = width.saturating_sub(4);
+                let cached = get_cached_message_lines(
+                    msg,
+                    content_width,
+                    app.diff_mode(),
+                    render_reasoning_message,
                 );
                 for line in cached {
                     lines.push(align_if_unset(line, align));
@@ -1613,27 +1813,7 @@ fn wrap_lines(
         wrapped_idx += count;
     }
 
-    let mut image_regions = Vec::new();
-    for (idx, line) in wrapped_lines.iter().enumerate() {
-        if let Some(hash) = super::super::mermaid::parse_image_placeholder(line) {
-            let mut height = 1u16;
-            for subsequent in wrapped_lines.iter().skip(idx + 1) {
-                if subsequent.spans.is_empty()
-                    || (subsequent.spans.len() == 1 && subsequent.spans[0].content.is_empty())
-                {
-                    height += 1;
-                } else {
-                    break;
-                }
-            }
-            image_regions.push(ImageRegion {
-                abs_line_idx: idx,
-                end_line: idx + height as usize,
-                hash,
-                height,
-            });
-        }
-    }
+    let image_regions = compute_image_regions(&wrapped_lines);
 
     let wrapped_plain_lines = Arc::new(wrapped_lines.iter().map(ui::line_plain_text).collect());
 
@@ -1732,27 +1912,7 @@ fn wrap_lines_with_map(
     }
     raw_to_wrapped.push(wrapped_idx);
 
-    let mut image_regions = Vec::new();
-    for (idx, line) in wrapped_lines.iter().enumerate() {
-        if let Some(hash) = super::super::mermaid::parse_image_placeholder(line) {
-            let mut height = 1u16;
-            for subsequent in wrapped_lines.iter().skip(idx + 1) {
-                if subsequent.spans.is_empty()
-                    || (subsequent.spans.len() == 1 && subsequent.spans[0].content.is_empty())
-                {
-                    height += 1;
-                } else {
-                    break;
-                }
-            }
-            image_regions.push(ImageRegion {
-                abs_line_idx: idx,
-                end_line: idx + height as usize,
-                hash,
-                height,
-            });
-        }
-    }
+    let image_regions = compute_image_regions(&wrapped_lines);
 
     let mut edit_tool_ranges = Vec::new();
     for (msg_idx, file_path, raw_start, raw_end, expandable) in edit_ranges {

@@ -56,7 +56,7 @@ fn create_scroll_test_app(
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     // Set deterministic session name for snapshot stability
     app.session.short_name = Some("test".to_string());
@@ -90,7 +90,7 @@ fn create_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::TestBacke
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -109,7 +109,7 @@ fn create_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::Tes
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -135,7 +135,7 @@ fn create_tool_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -162,7 +162,7 @@ fn create_tool_failed_output_copy_test_app()
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -337,10 +337,10 @@ fn test_streaming_repaint_does_not_leave_bracket_artifact() {
 
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
-    app.streaming_text = "[".to_string();
+    app.streaming.streaming_text = "[".to_string();
     let _ = render_and_snap(&app, &mut terminal);
 
-    app.streaming_text = "Process A: |██████████|".to_string();
+    app.streaming.streaming_text = "Process A: |██████████|".to_string();
     let text = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -523,12 +523,23 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         lines.push(format!("filler line {idx:02}"));
     }
 
-    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n"))];
+    // Join as separate markdown paragraphs: the repro depends on the file
+    // activity line owning its row with trailing blank cells (so a blank->blank
+    // diff skips repainting the injected ghost). Single newlines now soft-wrap
+    // into one flowing paragraph, which would repaint over the ghost cells.
+    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n\n"))];
     app.bump_display_messages_version();
     app.auto_scroll_paused = true;
     app.scroll_offset = 0;
 
-    let clean = render_and_snap(&app, &mut terminal);
+    // The transcript begins with the persistent header, which can be taller
+    // than this 12-row viewport. Scroll until the file activity line is
+    // actually on screen instead of assuming it sits at the top.
+    let mut clean = render_and_snap(&app, &mut terminal);
+    while !clean.contains("read lines") && app.scroll_offset < 200 {
+        app.scroll_offset += 1;
+        clean = render_and_snap(&app, &mut terminal);
+    }
     assert!(
         !clean.contains('Z'),
         "ghost marker must not be present before injection:\n{clean}"
@@ -554,7 +565,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         .draw(updates)
         .expect("inject trailing nines after file activity line");
 
-    app.scroll_offset = 1;
+    app.scroll_offset += 1;
     let scrolled = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -702,7 +713,10 @@ fn test_local_alt_m_falls_back_to_diagram_pane_when_side_panel_is_empty() {
 }
 
 #[test]
-fn test_local_alt_m_toggles_image_side_panel_visibility() {
+fn test_images_do_not_drive_side_panel_visibility() {
+    // Images now render inline in the transcript flow, so they must not flip the
+    // side panel on, arm an auto-hide timer, or otherwise behave like the old
+    // pinned-image side pane.
     let mut app = create_test_app();
     app.is_remote = true;
     app.side_panel = crate::side_panel::SidePanelSnapshot::default();
@@ -711,95 +725,13 @@ fn test_local_alt_m_toggles_image_side_panel_visibility() {
         data: "image-data".to_string(),
         label: Some("preview.png".to_string()),
         source: crate::session::RenderedImageSource::UserInput,
+        anchor: None,
     });
 
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: OFF".to_string()));
-
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(!app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: ON".to_string()));
-}
-
-#[test]
-fn test_explicitly_hidden_image_side_panel_stays_hidden_after_server_reload() {
-    // Reproduces an Alt+M hide being undone by a server reload/reconnect: the
-    // history snapshot repopulates remote_side_pane_images while
-    // pinned_images_seen_count resets to 0, which previously looked like new
-    // images and re-revealed the panel.
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    });
-
-    // User explicitly hides the image side panel.
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.side_panel_user_hidden);
-    assert!(app.side_panel_explicit_hidden);
-
-    // Simulate a server reload/reconnect: the seen count is reset while the
-    // image snapshot is re-applied with the same images.
-    app.pinned_images_seen_count = 0;
-    app.remote_side_pane_images = vec![crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    }];
-
-    app.update_pinned_images_auto_hide();
-
-    // The panel must remain hidden because the user explicitly closed it.
-    assert!(app.side_panel_user_hidden);
-    assert!(app.side_panel_explicit_hidden);
+    // Auto-hide bookkeeping is now a no-op for images.
+    assert!(!app.update_pinned_images_auto_hide());
     assert!(app.pinned_images_auto_hide_deadline.is_none());
-
-    // Alt+M still toggles it back on.
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
     assert!(!app.side_panel_user_hidden);
-    assert!(!app.side_panel_explicit_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: ON".to_string()));
-}
-
-#[test]
-fn test_pinned_image_side_panel_auto_hides_and_mentions_alt_m() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    });
-
-    assert!(app.update_pinned_images_auto_hide());
-    assert!(!app.side_panel_user_hidden);
-    assert!(app.pinned_images_auto_hide_deadline.is_some());
-
-    app.pinned_images_auto_hide_deadline =
-        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-    assert!(app.update_pinned_images_auto_hide());
-
-    assert!(app.side_panel_user_hidden);
-    assert!(app.pinned_images_auto_hide_deadline.is_none());
-    let notice = app
-        .display_messages
-        .last()
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-    assert!(notice.contains("Pinned image side panel hidden automatically"));
-    assert!(notice.contains(crate::tui::keybind::side_panel_toggle_key_label()));
 }
 
 #[test]

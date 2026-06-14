@@ -93,29 +93,35 @@ async fn resolve_spawn_working_dir(
         .filter(|dir| !dir.trim().is_empty())
 }
 
-fn spawn_visible_session_window(
+/// Launch a headed window for `session_id`, exporting the given spawn context
+/// (`JCODE_SPAWN_KIND`, swarm/coordinator ids, ...) to spawn hooks and
+/// spawned terminals so external programs can reroute the window.
+fn spawn_visible_session_window_with_context(
     session_id: &str,
     cwd: &std::path::Path,
     selfdev_requested: bool,
     provider_key: Option<&str>,
+    context: &crate::session_launch::SessionSpawnContext,
 ) -> anyhow::Result<bool> {
     let exe = crate::build::client_update_candidate(selfdev_requested)
         .map(|(path, _label)| path)
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("jcode"));
     if selfdev_requested {
-        crate::session_launch::spawn_selfdev_in_new_terminal_with_provider(
+        crate::session_launch::spawn_selfdev_in_new_terminal_with_context(
             &exe,
             session_id,
             cwd,
             provider_key,
+            context,
         )
     } else {
-        crate::session_launch::spawn_resume_in_new_terminal_with_provider(
+        crate::session_launch::spawn_resume_in_new_terminal_with_context(
             &exe,
             session_id,
             cwd,
             provider_key,
+            context,
         )
     }
 }
@@ -185,15 +191,14 @@ async fn resolve_coordinator_spawn_identity(
     if let Some(agent) = {
         let agent_sessions = sessions.read().await;
         agent_sessions.get(req_session_id).cloned()
-    } {
-        if let Ok(agent_guard) = agent.try_lock() {
-            return CoordinatorSpawnIdentity {
-                model: Some(agent_guard.provider_model()),
-                provider_key: agent_guard.session_provider_key(),
-                route_api_method: agent_guard.session_route_api_method(),
-                is_canary: agent_guard.is_canary(),
-            };
-        }
+    } && let Ok(agent_guard) = agent.try_lock()
+    {
+        return CoordinatorSpawnIdentity {
+            model: Some(agent_guard.provider_model()),
+            provider_key: agent_guard.session_provider_key(),
+            route_api_method: agent_guard.session_route_api_method(),
+            is_canary: agent_guard.is_canary(),
+        };
     }
 
     // Agent busy (mid-turn) or not resident: read the authoritative persisted
@@ -226,6 +231,39 @@ async fn resolve_coordinator_spawn_identity(
     }
 }
 
+/// Split a configured swarm model that carries an explicit auth-route prefix
+/// (`openai-api:`, `openai-oauth:`, `claude-api:`, `claude-oauth:`) into a
+/// structured selection so spawned sessions pin the exact provider + auth
+/// method instead of guessing from the bare model name.
+///
+/// Example: `agents.swarm_model = "openai-api:gpt-5.5"` resolves to
+/// `model = gpt-5.5`, `provider_key = openai-api-key`,
+/// `route_api_method = openai-api-key`, which makes every spawned agent use
+/// GPT-5.5 on the OpenAI API key route regardless of the coordinator's model.
+///
+/// Returns `None` for models without such a prefix, or for prefixes that carry
+/// no API-vs-OAuth decision (bare provider aliases, OpenRouter, Copilot, ...).
+/// Those keep their prefixed model and route correctly via the existing
+/// session-restore path.
+fn explicit_route_for_configured_model(model: &str) -> Option<SwarmSpawnSelection> {
+    let (_, prefix, bare) = crate::provider::explicit_model_provider_prefix(model)?;
+    let bare = bare.trim();
+    if bare.is_empty() {
+        return None;
+    }
+    // Only the dual-auth (Anthropic/OpenAI OAuth-vs-API) prefixes carry an
+    // explicit credential decision worth pinning. The canonical parser maps the
+    // prefix to its stable route id, which `ModelRouteApiMethod::parse` round-
+    // trips back to the exact auth method when the spawned session is restored.
+    let route_id = jcode_provider_core::AuthRoute::parse_explicit_credential_prefix(prefix)?
+        .route_api_method();
+    Some(SwarmSpawnSelection {
+        model: Some(bare.to_string()),
+        provider_key: Some(route_id.to_string()),
+        route_api_method: Some(route_id.to_string()),
+    })
+}
+
 fn resolve_swarm_spawn_selection(
     configured_swarm_model: Option<String>,
     coordinator: &CoordinatorSpawnIdentity,
@@ -244,6 +282,14 @@ fn resolve_swarm_spawn_selection(
 
     match configured_swarm_model {
         Some(model) => {
+            // A configured model may pin an explicit provider + auth route via a
+            // prefix (e.g. "openai-api:gpt-5.5"). Honor it directly so spawned
+            // agents do NOT inherit the coordinator's model/auth and instead use
+            // the requested model on the requested API route.
+            if let Some(selection) = explicit_route_for_configured_model(&model) {
+                return selection;
+            }
+
             // A concrete configured model only inherits the coordinator's
             // provider_key/route when it targets the same model; otherwise the
             // route would point at the wrong provider/auth mode.
@@ -266,9 +312,10 @@ fn resolve_swarm_spawn_selection(
         }
         None => SwarmSpawnSelection {
             model: coordinator.model.clone(),
-            provider_key: coordinator.provider_key.clone().or_else(|| {
-                provider_key_for_spawn_model(coordinator.model.as_deref(), None)
-            }),
+            provider_key: coordinator
+                .provider_key
+                .clone()
+                .or_else(|| provider_key_for_spawn_model(coordinator.model.as_deref(), None)),
             route_api_method: coordinator.route_api_method.clone(),
         },
     }
@@ -478,7 +525,20 @@ pub(super) async fn spawn_swarm_agent(
             spawn_route_api_method.as_deref(),
             coordinator_is_canary,
             startup_message.as_deref(),
-            spawn_visible_session_window,
+            |session_id, cwd, selfdev_requested, provider_key| {
+                // Tag the headed window as a swarm-agent spawn so spawn hooks
+                // and terminals can identify and reroute it (JCODE_SPAWN_*).
+                let context = crate::session_launch::SessionSpawnContext::kind("swarm-agent")
+                    .env("JCODE_SPAWN_SWARM_ID", swarm_id)
+                    .env("JCODE_SPAWN_COORDINATOR_SESSION_ID", req_session_id);
+                spawn_visible_session_window_with_context(
+                    session_id,
+                    cwd,
+                    selfdev_requested,
+                    provider_key,
+                    &context,
+                )
+            },
         ),
     };
 

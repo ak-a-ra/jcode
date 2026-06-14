@@ -7,6 +7,8 @@ mod bg;
 mod browser;
 mod codesearch;
 mod communicate;
+#[cfg(target_os = "macos")]
+mod computer;
 mod conversation_search;
 mod debug_socket;
 mod edit;
@@ -191,6 +193,13 @@ impl Registry {
             Self::insert_tool_timed(&mut m, &mut timings, "bash", bash::BashTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "browser", browser::BrowserTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "open", open::OpenTool::new);
+            #[cfg(target_os = "macos")]
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "macos_computer_use",
+                computer::ComputerTool::new,
+            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -502,6 +511,38 @@ impl Registry {
     /// Outputs that would push total context beyond this are truncated.
     const CONTEXT_GUARD_THRESHOLD: f32 = 0.90;
 
+    /// Fire the `post_tool` observer hook with tool outcome metadata.
+    /// No-op (without building the payload) when the hook is not configured.
+    fn fire_post_tool_hook(
+        resolved_name: &str,
+        ctx: &ToolContext,
+        result: &Result<ToolOutput>,
+        latency_ms: u64,
+    ) {
+        if !crate::hooks::hook_configured("post_tool") {
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new("post_tool")
+            .session_id(ctx.session_id.clone())
+            .field("TOOL_NAME", resolved_name)
+            .field("STATUS", if result.is_ok() { "ok" } else { "error" })
+            .field("DURATION_MS", latency_ms.to_string());
+        if let Some(dir) = &ctx.working_dir {
+            event = event.cwd(dir.display().to_string());
+        }
+        match result {
+            Ok(output) => {
+                event = event.field("OUTPUT_BYTES", output.output.len().to_string());
+            }
+            Err(error) => {
+                const ERROR_LIMIT: usize = 1000;
+                let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
+                event = event.field("ERROR", message);
+            }
+        }
+        crate::hooks::dispatch_observer(event);
+    }
+
     /// Maximum fraction of context budget a single tool output may occupy.
     /// Even if we have room, a single output shouldn't dominate the context.
     const SINGLE_OUTPUT_MAX_FRACTION: f32 = 0.30;
@@ -540,6 +581,32 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
+        // User-configured pre_tool gate: external policy hook that can block
+        // this call (exit 2). Skipped entirely when not configured.
+        if crate::hooks::hook_configured("pre_tool") {
+            let input_json = input.to_string();
+            let working_dir = ctx
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string());
+            let decision = crate::hooks::run_pre_tool_gate(
+                &ctx.session_id,
+                working_dir.as_deref(),
+                resolved_name,
+                &input_json,
+            )
+            .await;
+            if let crate::hooks::GateDecision::Block { reason } = decision {
+                let mut fields =
+                    Self::tool_lifecycle_fields("blocked", name, resolved_name, &input, &ctx);
+                fields.push(("block_reason".to_string(), reason.clone()));
+                crate::logging::event_warn("TOOL_LIFECYCLE", fields);
+                return Err(anyhow::anyhow!(
+                    "Tool call blocked by pre_tool hook: {reason}"
+                ));
+            }
+        }
+
         crate::logging::event_info(
             "TOOL_LIFECYCLE",
             Self::tool_lifecycle_fields("start", name, resolved_name, &input, &ctx),
@@ -550,6 +617,7 @@ impl Registry {
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
         crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
+        Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
 
         let mut output = match result {
             Ok(output) => output,
@@ -833,10 +901,12 @@ impl Registry {
                 // under the current config fingerprint; prune servers that are
                 // no longer configured. (#206 Phase 2)
                 {
-                    let (live_by_server, config_snapshot): (
-                        std::collections::BTreeMap<String, Vec<crate::mcp::McpToolDef>>,
-                        Vec<(String, crate::mcp::McpServerConfig)>,
-                    ) = {
+                    // Live tool defs grouped by server, plus a snapshot of the
+                    // configured servers, captured under one read lock.
+                    type LiveToolsByServer =
+                        std::collections::BTreeMap<String, Vec<crate::mcp::McpToolDef>>;
+                    type ConfigSnapshot = Vec<(String, crate::mcp::McpServerConfig)>;
+                    let (live_by_server, config_snapshot): (LiveToolsByServer, ConfigSnapshot) = {
                         let manager = mcp_manager.read().await;
                         let mut grouped: std::collections::BTreeMap<
                             String,

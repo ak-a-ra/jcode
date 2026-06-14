@@ -201,11 +201,22 @@ fn model_picker_route_is_current(
     current_model: &str,
     current_provider: &str,
 ) -> bool {
-    model_name == current_model
-        && jcode_provider_core::model_route_provider_labels_match(&route.provider, current_provider)
+    if model_name != current_model {
+        return false;
+    }
+    // Remote sessions whose catalog arrives as names-only do not carry a
+    // provider name, so `current_provider` is the generic "remote"
+    // placeholder. The model name was synthesized into a real provider route
+    // (Copilot/OpenAI/...), so a provider-label comparison would never match
+    // and the current model would not preselect. Fall back to name-only
+    // matching in that case.
+    if current_provider.trim().eq_ignore_ascii_case("remote") {
+        return true;
+    }
+    jcode_provider_core::model_route_provider_labels_match(&route.provider, current_provider)
 }
 
-const RECOMMENDED_MODELS: &[&str] = &["gpt-5.5", "claude-opus-4-8"];
+const RECOMMENDED_MODELS: &[&str] = &["gpt-5.5", "claude-fable-5", "claude-opus-4-8"];
 
 fn model_picker_recommendation_rank(name: &str) -> usize {
     RECOMMENDED_MODELS
@@ -343,11 +354,13 @@ impl App {
         snapshot: jcode_provider_core::ModelCatalogSnapshot,
     ) -> bool {
         let mut provider_meta_changed = false;
+        let mut provider_name_changed = false;
         if let Some(name) = snapshot.provider_name
             && self.remote_provider_name.as_deref() != Some(name.as_str())
         {
             self.remote_provider_name = Some(name);
             provider_meta_changed = true;
+            provider_name_changed = true;
         }
         if let Some(model) = snapshot.provider_model
             && self.remote_provider_model.as_deref() != Some(model.as_str())
@@ -356,10 +369,85 @@ impl App {
             self.remote_provider_model = Some(model);
             provider_meta_changed = true;
         }
+        // A names-only snapshot (models without route expansion) arrives when the
+        // server downgrades an oversized AvailableModelsUpdated frame. Keep the
+        // previously known detailed routes in that case; the picker synthesizes
+        // fallback routes for any newly appearing models. If the provider
+        // identity changed, the old routes are stale and must be dropped.
+        let names_only = snapshot.model_routes.is_empty() && !snapshot.available_models.is_empty();
         self.remote_available_entries = snapshot.available_models;
-        self.remote_model_options = snapshot.model_routes;
+        if !names_only || provider_name_changed {
+            self.remote_model_options = snapshot.model_routes;
+        }
         self.invalidate_model_picker_cache();
         provider_meta_changed
+    }
+
+    /// Ensure every advertised remote model has at least one picker route.
+    ///
+    /// Detailed route expansion can lag behind the model-name catalog (stale
+    /// disk cache, names-only catalog updates). Without this, newly released
+    /// models are invisible in the picker even though the server lists them.
+    ///
+    /// A model also needs re-synthesis when its persisted routes predate an
+    /// auth method: an older session may have baked an OAuth-only fallback
+    /// route into the cache, which would otherwise permanently hide the
+    /// API-key route for that model.
+    fn extend_remote_routes_for_uncovered_models(
+        &self,
+        routes: &mut Vec<crate::provider::ModelRoute>,
+    ) {
+        if !self.is_remote || self.remote_available_entries.is_empty() {
+            return;
+        }
+        let mut methods_by_model: std::collections::HashMap<&str, HashSet<&str>> =
+            std::collections::HashMap::new();
+        for route in routes.iter() {
+            methods_by_model
+                .entry(route.model.as_str())
+                .or_default()
+                .insert(route.api_method.as_str());
+        }
+        let auth = crate::auth::AuthStatus::check_fast();
+        let missing: Vec<String> = self
+            .remote_available_entries
+            .iter()
+            .filter(|model| match methods_by_model.get(model.as_str()) {
+                None => true,
+                Some(methods) => {
+                    crate::provider::provider_for_model(model) == Some("claude")
+                        && !model.contains('/')
+                        && ((auth.anthropic.has_api_key && !methods.contains("claude-api"))
+                            || (auth.anthropic.has_oauth && !methods.contains("claude-oauth")))
+                }
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let existing: HashSet<(String, String, String)> = routes
+            .iter()
+            .map(|route| {
+                (
+                    route.model.clone(),
+                    route.provider.clone(),
+                    route.api_method.clone(),
+                )
+            })
+            .collect();
+        for route in crate::provider::remote_model_routes_fallback(
+            self.remote_provider_name.as_deref(),
+            &missing,
+        ) {
+            if !existing.contains(&(
+                route.model.clone(),
+                route.provider.clone(),
+                route.api_method.clone(),
+            )) {
+                routes.push(route);
+            }
+        }
     }
 
     fn hydrate_remote_model_catalog_snapshot(
@@ -632,7 +720,8 @@ impl App {
         let routes_started = std::time::Instant::now();
         let routes: Vec<crate::provider::ModelRoute> = if self.is_remote {
             if !self.remote_model_options.is_empty() {
-                let routes = std::mem::take(&mut self.remote_model_options);
+                let mut routes = std::mem::take(&mut self.remote_model_options);
+                self.extend_remote_routes_for_uncovered_models(&mut routes);
                 let routes_ms = routes_started.elapsed().as_millis();
                 self.remote_model_options = self.open_model_picker_with_routes(
                     cache_signature,
@@ -644,7 +733,13 @@ impl App {
                 );
                 return;
             }
-            self.build_remote_model_routes_lightweight_fallback(&current_model)
+            // Names-only remote catalog: synthesize properly classified
+            // provider routes (Comtegra/Copilot/Bedrock/Gemini/OpenRouter/…)
+            // rather than a generic "remote-catalog" placeholder. This is the
+            // final route set for this open (there is no async upgrade after
+            // it), and the full fallback only reads local config/disk caches,
+            // so it is cheap enough for the cold-open path.
+            self.build_remote_model_routes_fallback()
         } else {
             self.simplified_model_routes_for_picker(&current_model)
         };
@@ -1197,7 +1292,9 @@ impl App {
                     ("remote", self.is_remote.to_string()),
                     (
                         "simplified",
-                        crate::perf::tui_policy().simplified_model_picker.to_string(),
+                        crate::perf::tui_policy()
+                            .simplified_model_picker
+                            .to_string(),
                     ),
                     ("routes_in", routes.len().to_string()),
                     ("models", model_order.len().to_string()),
@@ -1327,7 +1424,9 @@ impl App {
         let routes_started = std::time::Instant::now();
         let routes: Vec<crate::provider::ModelRoute> = if self.is_remote {
             if !self.remote_model_options.is_empty() {
-                std::mem::take(&mut self.remote_model_options)
+                let mut routes = std::mem::take(&mut self.remote_model_options);
+                self.extend_remote_routes_for_uncovered_models(&mut routes);
+                routes
             } else {
                 self.build_remote_model_routes_lightweight_fallback(&current_model)
             }
@@ -1457,7 +1556,7 @@ impl App {
             return Ok(false);
         }
         let is_default =
-            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'd');
+            modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'b');
         let is_favorite =
             modifiers.contains(KeyModifiers::CONTROL) && key_char_eq_ignore_ascii_case(code, 'f');
         let is_cycle_favorite =
@@ -1610,7 +1709,8 @@ impl App {
     }
 
     pub(super) fn open_session_picker(&mut self) {
-        let (picker, status) = if let Some((server_groups, orphan_sessions)) =
+        let current_dir = self.session.working_dir.clone();
+        let (mut picker, status) = if let Some((server_groups, orphan_sessions)) =
             session_picker::load_cached_sessions_grouped()
         {
             (
@@ -1620,6 +1720,7 @@ impl App {
         } else {
             (SessionPicker::loading(), "Loading sessions...")
         };
+        picker.set_current_dir(current_dir);
         self.session_picker_overlay = Some(RefCell::new(picker));
         self.session_picker_mode = SessionPickerMode::Resume;
         self.set_status_notice(status);
@@ -1644,9 +1745,42 @@ impl App {
         server_groups: Vec<session_picker::ServerGroup>,
         orphan_sessions: Vec<session_picker::SessionInfo>,
     ) -> bool {
+        // When a picker overlay is already on screen (the common case: the cached
+        // list rendered instantly and this is the async full-refresh landing),
+        // reseed it in place so the user's selection, scroll, search, focus, and
+        // multi-select survive the swap. Rebuilding a fresh picker here used to
+        // yank the view out from under the user a second or two after they opened
+        // `/resume`, which felt like a lag/jump.
+        let has_overlay = self.session_picker_overlay.is_some();
+        if has_overlay {
+            let notice = match self.session_picker_mode {
+                SessionPickerMode::Resume => {
+                    if let Some(existing) = self.session_picker_overlay.as_ref() {
+                        existing
+                            .borrow_mut()
+                            .reseed_grouped(server_groups, orphan_sessions);
+                    }
+                    "Sessions loaded"
+                }
+                SessionPickerMode::CatchUp => {
+                    if let Some(existing) = self.session_picker_overlay.as_ref() {
+                        let mut picker = existing.borrow_mut();
+                        // Keep the catch-up filter active; reseed preserves it.
+                        picker.activate_catchup_filter();
+                        picker.reseed_grouped(server_groups, orphan_sessions);
+                    }
+                    "Catch Up sessions loaded"
+                }
+                SessionPickerMode::Onboarding { .. } => return false,
+            };
+            self.set_status_notice(notice);
+            return true;
+        }
+
         match self.session_picker_mode {
             SessionPickerMode::Resume => {
-                let picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
+                let mut picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
+                picker.set_current_dir(self.session.working_dir.clone());
                 self.session_picker_overlay = Some(RefCell::new(picker));
                 self.set_status_notice("Sessions loaded");
                 true
@@ -1654,6 +1788,7 @@ impl App {
             SessionPickerMode::CatchUp => {
                 let mut picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
                 picker.activate_catchup_filter();
+                picker.set_current_dir(self.session.working_dir.clone());
                 self.session_picker_overlay = Some(RefCell::new(picker));
                 self.set_status_notice("Catch Up sessions loaded");
                 true
@@ -1955,7 +2090,7 @@ impl App {
                 name
             )));
         }
-        crate::tui::workspace_client::queue_resume_session(session_id);
+        self.workspace_client.queue_resume_session(session_id);
         self.session_picker_overlay = None;
         self.session_picker_mode = SessionPickerMode::Resume;
         self.set_status_notice(format!("Switching → {}", name));
@@ -2359,7 +2494,7 @@ impl App {
                 }
             }
             code if modifiers.contains(KeyModifiers::CONTROL)
-                && key_char_eq_ignore_ascii_case(code, 'd') =>
+                && key_char_eq_ignore_ascii_case(code, 'b') =>
             {
                 if let Some(ref picker) = self.inline_interactive_state {
                     if !picker_is_runtime_model_picker(picker) {
@@ -2629,10 +2764,7 @@ impl App {
                                             ("spec", spec.clone()),
                                             ("active_model", active_model),
                                             ("provider", self.provider.name().to_string()),
-                                            (
-                                                "api_method",
-                                                route_selection.api_method.clone(),
-                                            ),
+                                            ("api_method", route_selection.api_method.clone()),
                                         ],
                                     );
                                 }
@@ -2642,10 +2774,7 @@ impl App {
                                         vec![
                                             ("spec", spec.clone()),
                                             ("provider", route.provider.clone()),
-                                            (
-                                                "api_method",
-                                                route_selection.api_method.clone(),
-                                            ),
+                                            ("api_method", route_selection.api_method.clone()),
                                             ("error", error.to_string()),
                                         ],
                                     );
@@ -2700,11 +2829,22 @@ impl App {
     }
 
     pub(super) fn picker_fuzzy_score(pattern: &str, text: &str) -> Option<i32> {
-        let pat: Vec<char> = pattern
+        let pat = Self::picker_fuzzy_pattern(pattern);
+        Self::picker_fuzzy_score_with_pattern(&pat, text)
+    }
+
+    /// Normalize a fuzzy-match pattern (lowercase, drop whitespace) into chars.
+    /// Hoist this out of per-entry scoring so a filter pass over N entries
+    /// normalizes the pattern once instead of N times per keystroke.
+    pub(super) fn picker_fuzzy_pattern(pattern: &str) -> Vec<char> {
+        pattern
             .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
-            .collect();
+            .collect()
+    }
+
+    pub(super) fn picker_fuzzy_score_with_pattern(pat: &[char], text: &str) -> Option<i32> {
         let txt: Vec<char> = text.to_lowercase().chars().collect();
         if pat.is_empty() {
             return Some(0);
@@ -2750,13 +2890,16 @@ impl App {
         if picker.filter.is_empty() {
             picker.filtered = (0..picker.entries.len()).collect();
         } else {
+            // Normalize the filter pattern once per keystroke instead of once per
+            // entry inside picker_fuzzy_score.
+            let pat = Self::picker_fuzzy_pattern(&picker.filter);
             let mut scored: Vec<(usize, i32)> = picker
                 .entries
                 .iter()
                 .enumerate()
                 .filter_map(|(i, m)| {
                     let filter_text = picker.filter_text(m);
-                    Self::picker_fuzzy_score(&picker.filter, &filter_text).map(|s| {
+                    Self::picker_fuzzy_score_with_pattern(&pat, &filter_text).map(|s| {
                         let usage_bonus = m.usage_score.min(i32::MAX as u32) as i32;
                         let bonus = usage_bonus + if m.recommended { 5 } else { 0 };
                         (i, s + bonus)
@@ -2987,6 +3130,38 @@ mod tests {
             &copilot_route,
             Some("gpt-5.5"),
             Some("openai"),
+        ));
+    }
+
+    #[test]
+    fn model_picker_default_route_marks_anthropic_api_config_provider() {
+        // Regression: config `default_provider = "anthropic-api"` is the
+        // dual-auth spelling of the route keyed `anthropic-api-key`. The picker
+        // must still mark the Anthropic API-key route as the default ★ even
+        // though the two spellings normalize differently, and must NOT mark the
+        // OAuth route for the same model.
+        let api_route = picker_option_with_method("Anthropic", "anthropic-api-key");
+        let oauth_route = picker_option_with_method("Anthropic", "claude-oauth");
+
+        assert!(model_picker_route_is_default(
+            "claude-opus-4-8",
+            &api_route,
+            Some("claude-opus-4-8"),
+            Some("anthropic-api"),
+        ));
+        assert!(!model_picker_route_is_default(
+            "claude-opus-4-8",
+            &oauth_route,
+            Some("claude-opus-4-8"),
+            Some("anthropic-api"),
+        ));
+
+        // The equivalent `claude-api` spelling behaves identically.
+        assert!(model_picker_route_is_default(
+            "claude-opus-4-8",
+            &api_route,
+            Some("claude-opus-4-8"),
+            Some("claude-api"),
         ));
     }
 

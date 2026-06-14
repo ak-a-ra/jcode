@@ -138,6 +138,62 @@ fn resolved_named_profile_suggests_newest_cached_live_release() {
 }
 
 #[test]
+fn resolved_named_profile_skips_non_chat_models_when_picking_newest_default() {
+    // Regression: a profile's auto-selected default must never be a non-chat
+    // model (TTS/speech/embeddings/image/etc.). Catalogs such as Groq expose
+    // their entire model list, and the newest-released entry is frequently a
+    // non-chat model (e.g. `canopylabs/orpheus-*` TTS) which previously won the
+    // newest-by-created tiebreak and became the chat default.
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&["JCODE_HOME"]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    crate::env::set_var("JCODE_HOME", temp.path());
+    jcode_provider_openrouter::save_disk_cache_with_source_for_namespace(
+        "cerebras",
+        &[
+            jcode_provider_openrouter::ModelInfo {
+                id: "older-chat-model".to_string(),
+                name: String::new(),
+                context_length: None,
+                pricing: Default::default(),
+                created: Some(1_700_000_000),
+            },
+            jcode_provider_openrouter::ModelInfo {
+                id: "newer-chat-model".to_string(),
+                name: String::new(),
+                context_length: None,
+                pricing: Default::default(),
+                created: Some(1_800_000_000),
+            },
+            // Newest of all, but a non-chat (TTS) model that must be skipped.
+            jcode_provider_openrouter::ModelInfo {
+                id: "canopylabs/orpheus-v1-english".to_string(),
+                name: String::new(),
+                context_length: None,
+                pricing: Default::default(),
+                created: Some(1_900_000_000),
+            },
+            jcode_provider_openrouter::ModelInfo {
+                id: "whisper-large-v3".to_string(),
+                name: String::new(),
+                context_length: None,
+                pricing: Default::default(),
+                created: Some(1_950_000_000),
+            },
+        ],
+        Some(CEREBRAS_PROFILE.api_base),
+    );
+
+    let resolved = resolve_openai_compatible_profile(CEREBRAS_PROFILE);
+
+    assert_eq!(
+        resolved.default_model.as_deref(),
+        Some("newer-chat-model"),
+        "newest *chat* model must win; non-chat models (orpheus TTS, whisper STT) are skipped"
+    );
+}
+
+#[test]
 fn minimax_token_plan_keys_resolve_to_china_endpoint_without_changing_international_default() {
     let _lock = crate::storage::lock_test_env();
     let _guard = EnvGuard::save(&["OPENAI_API_KEY"]);
@@ -322,8 +378,14 @@ fn matrix_tui_login_selection_supports_numbers_and_names() {
         resolve_login_selection("2", &providers).map(|provider| provider.id),
         Some("claude")
     );
+    // `anthropic-api` sits at 3 (between claude and openai), shifting the
+    // rest of the list down one slot relative to the pre-May-2026 order.
     assert_eq!(
-        resolve_login_selection("6", &providers).map(|provider| provider.id),
+        resolve_login_selection("3", &providers).map(|provider| provider.id),
+        Some("anthropic-api")
+    );
+    assert_eq!(
+        resolve_login_selection("7", &providers).map(|provider| provider.id),
         Some("bedrock")
     );
     assert_eq!(
@@ -341,7 +403,7 @@ fn matrix_tui_login_selection_supports_numbers_and_names() {
     assert!(
         providers
             .iter()
-            .take(6)
+            .take(7)
             .any(|provider| provider.id == "bedrock")
     );
     assert!(resolve_login_selection("google", &providers).is_none());
@@ -354,24 +416,29 @@ fn matrix_cli_login_selection_preserves_existing_order() {
         resolve_login_selection("1", &providers).map(|provider| provider.id),
         Some("auto-import")
     );
+    // `anthropic-api` at 3 shifted everything after it down one slot.
     assert_eq!(
-        resolve_login_selection("4", &providers).map(|provider| provider.id),
-        Some("jcode")
+        resolve_login_selection("3", &providers).map(|provider| provider.id),
+        Some("anthropic-api")
     );
     assert_eq!(
         resolve_login_selection("5", &providers).map(|provider| provider.id),
-        Some("copilot")
+        Some("jcode")
     );
     assert_eq!(
         resolve_login_selection("6", &providers).map(|provider| provider.id),
-        Some("openrouter")
+        Some("copilot")
     );
     assert_eq!(
         resolve_login_selection("7", &providers).map(|provider| provider.id),
-        Some("bedrock")
+        Some("openrouter")
     );
     assert_eq!(
         resolve_login_selection("8", &providers).map(|provider| provider.id),
+        Some("bedrock")
+    );
+    assert_eq!(
+        resolve_login_selection("9", &providers).map(|provider| provider.id),
         Some("azure")
     );
     assert_eq!(

@@ -114,8 +114,8 @@ mouse_capture = true
 # Enable debug socket for external control/testing (default: false)
 debug_socket = false
 
-# Show thinking/reasoning content (default: false)
-show_thinking = false
+# Show thinking/reasoning content (default: true)
+show_thinking = true
 
 # How to display reasoning/thinking content: "off", "full", or "current".
 #   off     - never show reasoning
@@ -123,7 +123,7 @@ show_thinking = false
 #   current - show only the live reasoning; collapse it once the model commits
 #             an assistant message or runs a tool, then show the next one
 # When unset, falls back to show_thinking (true => full, false => off).
-# reasoning_display = "current"
+reasoning_display = "current"
 
 # Markdown spacing style: "compact" (chat/TUI) or "document" (docs-like)
 # markdown_spacing = "compact"
@@ -217,14 +217,21 @@ tool_profile = "acp"
 
 [provider]
 # Default model (optional, uses provider default if not set)
-# Set via /model picker with Ctrl+D to save as default
-# default_model = "claude-opus-4-6"
-# Default provider (optional: claude|openai|copilot|openrouter)
-# When set, this provider is preferred on startup if available
+# Set via /model picker with Ctrl+B to save as default
+# default_model = "claude-fable-5"
+# Default provider (optional: claude|anthropic-api|openai|openai-api|copilot|openrouter|...)
+# When set, this provider is preferred on startup if available.
+#   claude        = Claude via OAuth/subscription (token in ~/.jcode/auth.json)
+#   anthropic-api = Claude via direct Anthropic API key (ANTHROPIC_API_KEY env
+#                   or ~/.config/jcode/anthropic.env). API-key mode does NOT fall
+#                   back to OAuth; configure the key first.
+# `claude` and `anthropic-api` are distinct providers with distinct credentials.
+# See docs/AUTH_CREDENTIAL_SOURCES.md for where each credential lives.
 # default_provider = "copilot"
 # OpenAI reasoning effort (none|low|medium|high|xhigh)
 openai_reasoning_effort = "low"
 # Anthropic reasoning effort for Claude reasoning models (none|low|medium|high; xhigh on Opus 4.7; max aliases to the strongest supported level)
+# Defaults to the strongest supported level for Claude Opus models (xhigh on Opus 4.7/4.8, high on older Opus) when unset; other models keep their own default.
 # anthropic_reasoning_effort = "medium"
 # OpenAI transport mode (auto|websocket|https)
 # openai_transport = "auto"
@@ -276,6 +283,82 @@ swarm_spawn_mode = "visible"
 # Whether the memory sidecar handles relevance/extraction.
 # memory_sidecar_enabled = false
 
+[terminal]
+# External command that takes over headed session spawns (swarm agents,
+# resume-in-new-terminal, self-dev windows, restart restores).
+#
+# When set, jcode runs `<spawn_hook> <jcode-binary> <args...>` instead of
+# opening a terminal emulator itself. The hook receives JCODE_SPAWN_* env vars
+# describing the spawn so multiplexers/wrappers can decide where it appears:
+#   JCODE_SPAWN_KIND        - "swarm-agent", "resume", "selfdev", "restart", ...
+#   JCODE_SPAWN_SESSION_ID  - session the window will run
+#   JCODE_SPAWN_TITLE       - suggested window/tab title
+#   JCODE_SPAWN_CWD         - session working directory (also the hook's cwd)
+#   JCODE_SPAWN_PROGRAM     - jcode binary path
+#   JCODE_SPAWN_COMMAND     - full shell-escaped command line
+#   JCODE_SPAWN_SWARM_ID / JCODE_SPAWN_COORDINATOR_SESSION_ID (swarm spawns)
+# If the hook fails to start, jcode falls back to built-in terminal detection.
+# Env override: JCODE_SPAWN_HOOK (set empty to disable a config hook).
+#
+# Examples:
+#   spawn_hook = "tmux new-window"                # tmux window per agent
+#   spawn_hook = "kitty @ launch --type=tab --"   # kitty tab per agent
+#   spawn_hook = "~/bin/jcode-spawn-router"       # custom placement script
+# spawn_hook = ""
+#
+# External command used to focus/raise an existing session window, replacing
+# the built-in wmctrl/xdotool title search. Receives JCODE_FOCUS_SESSION_ID
+# and JCODE_FOCUS_TITLE env vars. Pair with spawn_hook so the program that
+# placed the window also brings it to the front.
+# Env override: JCODE_FOCUS_HOOK (set empty to disable a config hook).
+#
+# Example:
+#   focus_hook = "~/bin/jcode-focus-router"
+# focus_hook = ""
+
+[hooks]
+# Lifecycle hooks: external commands jcode runs at well-defined points so other
+# programs can observe or gate agent behavior. Commands are parsed shell-style
+# (quotes work) but executed directly, with JCODE_HOOK_* env vars describing
+# the event:
+#   JCODE_HOOK_EVENT       - "turn_end", "session_start", "session_end",
+#                            "pre_tool", "post_tool"
+#   JCODE_HOOK_SESSION_ID  - the session the event belongs to
+#   JCODE_HOOK_CWD         - session working directory (also the hook's cwd)
+#   JCODE_HOOK_PAYLOAD     - JSON mirror of all fields
+# Hook processes get JCODE_HOOKS_DISABLED=1 so nested jcode calls don't recurse.
+#
+# All hooks except pre_tool are observers: detached, fire-and-forget, failures
+# only logged. Env overrides: JCODE_HOOK_TURN_END, JCODE_HOOK_SESSION_START,
+# JCODE_HOOK_SESSION_END, JCODE_HOOK_PRE_TOOL, JCODE_HOOK_POST_TOOL (set empty
+# to disable a config hook).
+#
+# Runs when an agent turn completes. Extra fields: JCODE_HOOK_STATUS
+# ("ok"/"error"), JCODE_HOOK_DURATION_MS, JCODE_HOOK_MODEL,
+# JCODE_HOOK_LAST_ASSISTANT_TEXT (first 4000 chars), JCODE_HOOK_ERROR.
+# turn_end = "~/bin/jcode-turn-notify"
+#
+# Runs when a session becomes active. Extra: JCODE_HOOK_SOURCE
+# ("create"/"attach"/"resume").
+# session_start = ""
+#
+# Runs when a session closes normally. Extra: JCODE_HOOK_SOURCE ("close").
+# session_end = ""
+#
+# Gate hook before every tool call. Receives JCODE_HOOK_TOOL_NAME and the tool
+# input JSON on stdin (truncated copy in JCODE_HOOK_TOOL_INPUT). Exit 0 allows
+# the call; exit 2 blocks it and stderr is shown to the model as the error;
+# any other outcome (other exits, timeout, missing binary) fails open.
+# pre_tool = "~/bin/jcode-tool-policy"
+#
+# Max milliseconds to wait for pre_tool before failing open (default: 5000).
+# pre_tool_timeout_ms = 5000
+#
+# Runs after each tool call. Extra fields: JCODE_HOOK_TOOL_NAME,
+# JCODE_HOOK_STATUS, JCODE_HOOK_DURATION_MS, JCODE_HOOK_OUTPUT_BYTES,
+# JCODE_HOOK_ERROR.
+# post_tool = ""
+
 [ambient]
 # Ambient mode: background agent that maintains your codebase
 # Enable ambient mode (default: false)
@@ -308,6 +391,13 @@ enabled = false
 port = 7643
 # Bind address (0.0.0.0 for LAN/Tailscale reachability)
 bind_addr = "0.0.0.0"
+
+[power]
+# Prevent the machine from suspending (idle/lid sleep) while any jcode session
+# is actively streaming/processing. The display can still sleep; only system
+# suspend is inhibited, and only for as long as work is in flight. (default: true)
+# Set JCODE_DISABLE_POWER_INHIBIT=1 to force-disable regardless of this setting.
+prevent_sleep_while_streaming = true
 
 [safety]
 # Notification settings for ambient mode events

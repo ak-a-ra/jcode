@@ -256,14 +256,8 @@ fn preferred_model_rank(orders: &[&[&str]], model: &str) -> usize {
 /// live dated ids (`claude-haiku-4-5-20251001`) match bare canonical ids
 /// (`claude-haiku-4-5`).
 fn normalize_model_for_preference(model: &str) -> String {
-    let lowered = model.trim().to_ascii_lowercase();
-    let without_long_context = lowered.strip_suffix("[1m]").unwrap_or(&lowered);
-    match without_long_context.rsplit_once('-') {
-        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|byte| byte.is_ascii_digit()) => {
-            head.to_string()
-        }
-        _ => without_long_context.to_string(),
-    }
+    let canonical = jcode_provider_core::model_id::canonical(model);
+    jcode_provider_core::model_id::strip_date_suffix(&canonical).to_string()
 }
 
 fn route_matches_activation(route: &ModelRoute, activation: &AuthActivationResult) -> bool {
@@ -1089,10 +1083,10 @@ mod tests {
 
     #[test]
     fn post_auth_model_selection_prefers_anthropic_flagship_over_catalog_order() {
-        // Live Anthropic catalogs list `claude-haiku-4-5-...` before
-        // `claude-opus-4-8`, and an API-key login supplies no activated model.
-        // Plain catalog order would auto-select Haiku; the flagship-first
-        // fallback must land on Opus instead.
+        // Live Anthropic catalogs list `claude-haiku-4-5-...` before the
+        // flagship, and an API-key login supplies no activated model. Plain
+        // catalog order would auto-select Haiku; the flagship-first fallback
+        // must land on the curated default (`claude-fable-5`) instead.
         let activation = AuthActivationResult {
             provider_id: Some("claude-api".to_string()),
             provider_label: Some("Anthropic".to_string()),
@@ -1104,12 +1098,13 @@ mod tests {
             route("claude-haiku-4-5-20251001", "Anthropic", "claude-api", true),
             route("claude-opus-4-6", "Anthropic", "claude-api", true),
             route("claude-opus-4-8", "Anthropic", "claude-api", true),
+            route("claude-fable-5", "Anthropic", "claude-api", true),
             route("claude-sonnet-4-6", "Anthropic", "claude-api", true),
         ];
 
         assert_eq!(
             provider_model_to_select_after_auth(&activation, None, &routes).as_deref(),
-            Some("claude-opus-4-8"),
+            Some("claude-fable-5"),
             "API-key login should auto-select the Anthropic flagship, not the first catalog route"
         );
     }
@@ -1126,11 +1121,12 @@ mod tests {
         let routes = vec![
             route("claude-haiku-4-5", "Anthropic", "claude-oauth", true),
             route("claude-opus-4-8", "Anthropic", "claude-oauth", true),
+            route("claude-fable-5", "Anthropic", "claude-oauth", true),
         ];
 
         assert_eq!(
             provider_model_to_select_after_auth(&activation, None, &routes).as_deref(),
-            Some("claude-opus-4-8")
+            Some("claude-fable-5")
         );
     }
 
@@ -1316,8 +1312,13 @@ mod tests {
                 "claude",
                 "claude-oauth",
                 "Anthropic",
-                &["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"],
-                "claude-opus-4-8",
+                &[
+                    "claude-haiku-4-5",
+                    "claude-sonnet-4-6",
+                    "claude-opus-4-8",
+                    "claude-fable-5",
+                ],
+                "claude-fable-5",
             ),
             (
                 "claude-api",
@@ -1327,8 +1328,9 @@ mod tests {
                     "claude-haiku-4-5-20251001",
                     "claude-sonnet-4-6",
                     "claude-opus-4-8",
+                    "claude-fable-5",
                 ],
-                "claude-opus-4-8",
+                "claude-fable-5",
             ),
             (
                 "openai",

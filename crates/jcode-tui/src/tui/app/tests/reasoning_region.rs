@@ -10,6 +10,11 @@
 // The in-progress (not yet newline-terminated) line renders live as a partial
 // `*…*` tail so reasoning trickles in token-by-token; that tail is rebuilt in
 // place on each delta and promoted to a committed line when its newline arrives.
+//
+// In `current` mode (the default) reasoning is *ephemeral*: only the live block is
+// ever shown. Once it closes (the model answers or runs a tool) the whole block is
+// sliced back out of the stream in place, so no per-block trace accumulates and
+// answer text keeps its order.
 
 #[test]
 fn reasoning_region_emits_dim_italic_lines_no_gutter_header_or_footer() {
@@ -17,20 +22,48 @@ fn reasoning_region_emits_dim_italic_lines_no_gutter_header_or_footer() {
 
     app.open_reasoning_region();
     app.append_reasoning_text("Let me think.\nSecond thought.");
-    app.close_reasoning_region(None);
-
-    let text = app.streaming_text();
-    assert!(!text.contains("Thinking"), "no header expected: {text:?}");
-    assert!(!text.contains('>'), "no blockquote gutter expected: {text:?}");
-    assert!(!text.contains("Thought for"), "no footer expected: {text:?}");
-    let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
+    // While streaming, reasoning is dim+italic markup in the live stream buffer.
+    let streaming = app.streaming_text().to_string();
     assert!(
-        text.contains(&format!("*{sentinel}Let me think.{sentinel}*")),
-        "first line not dim+italic: {text:?}"
+        !streaming.contains("Thinking"),
+        "no header expected: {streaming:?}"
     );
     assert!(
-        text.contains(&format!("*{sentinel}Second thought.{sentinel}*")),
-        "second line not dim+italic: {text:?}"
+        !streaming.contains('>'),
+        "no blockquote gutter expected: {streaming:?}"
+    );
+    assert!(
+        !streaming.contains("Thought for"),
+        "no footer expected: {streaming:?}"
+    );
+    let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
+    assert!(
+        streaming.contains(&format!("*{sentinel}Let me think.{sentinel}*")),
+        "first line not dim+italic: {streaming:?}"
+    );
+    assert!(
+        streaming.contains(&format!("*{sentinel}Second thought.{sentinel}*")),
+        "second line not dim+italic: {streaming:?}"
+    );
+
+    // In `current` mode (the default), closing anchors the block in the
+    // transcript flow as a display-only reasoning message: it leaves the live
+    // stream and never moves again.
+    app.close_reasoning_region(None);
+    assert!(
+        app.streaming_text().is_empty(),
+        "reasoning should leave the live stream once anchored: {:?}",
+        app.streaming_text()
+    );
+    let anchored = app
+        .display_messages
+        .iter()
+        .find(|m| m.role == "reasoning")
+        .expect("closed trace anchors as a display-only reasoning message");
+    assert!(
+        anchored.content.contains("Let me think."),
+        "anchored trace keeps its content: {:?}",
+        anchored.content
     );
 }
 
@@ -44,7 +77,12 @@ fn reasoning_region_closes_before_normal_output() {
     app.close_reasoning_region(None);
     app.append_streaming_text("Final answer.");
 
+    // The answer stays in the live stream and must never be styled as reasoning.
     let text = app.streaming_text();
+    assert!(
+        text.contains("Final answer."),
+        "answer present in stream: {text:?}"
+    );
     let answer_line = text
         .lines()
         .find(|l| l.contains("Final answer."))
@@ -53,9 +91,14 @@ fn reasoning_region_closes_before_normal_output() {
         !answer_line.contains(jcode_tui_markdown::REASONING_SENTINEL),
         "final answer must not be styled as reasoning: {answer_line:?}"
     );
+    // The reasoning left the stream and anchored as a display-only message.
     assert!(
-        text.contains("\n\nFinal answer."),
-        "missing blank-line separator before output: {text:?}"
+        !text.contains(jcode_tui_markdown::REASONING_SENTINEL),
+        "reasoning must not remain in the answer stream: {text:?}"
+    );
+    assert!(
+        app.display_messages.iter().any(|m| m.role == "reasoning"),
+        "closed trace anchors in the transcript"
     );
 }
 
@@ -92,13 +135,13 @@ fn reasoning_line_split_across_deltas_stays_one_run() {
     app.open_reasoning_region();
     app.append_reasoning_text("one ");
     app.append_reasoning_text("two\n");
-    app.close_reasoning_region(None);
 
-    let text = app.streaming_text();
+    // While streaming live, the split-across-deltas line is a single emphasis run.
+    let content = app.streaming_text();
     let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
     assert!(
-        text.contains(&format!("*{sentinel}one two{sentinel}*")),
-        "split line must be one emphasis run: {text:?}"
+        content.contains(&format!("*{sentinel}one two{sentinel}*")),
+        "split line must be one emphasis run: {content:?}"
     );
 }
 
@@ -110,9 +153,11 @@ fn reasoning_region_renders_dim_italic_text_without_gutter() {
 
     app.open_reasoning_region();
     app.append_reasoning_text("considering options\n");
-    app.close_reasoning_region(None);
 
-    let lines = crate::tui::markdown::render_markdown_with_width(app.streaming_text(), Some(80));
+    // The live reasoning renders dim+italic from the streaming buffer.
+    let reasoning_content = app.streaming_text().to_string();
+
+    let lines = crate::tui::markdown::render_markdown_with_width(&reasoning_content, Some(80));
     let body = lines
         .iter()
         .find(|l| {
@@ -248,7 +293,7 @@ fn reasoning_partial_promotes_to_committed_line_on_newline() {
 #[test]
 fn reasoning_close_promotes_pending_partial_line() {
     // Closing the region with an in-progress (no-newline) partial promotes it to a
-    // committed line exactly once.
+    // committed line exactly once, then collapses into the reasoning message.
     let mut app = create_test_app();
     let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
 
@@ -256,15 +301,382 @@ fn reasoning_close_promotes_pending_partial_line() {
     app.append_reasoning_text("final thought");
     app.close_reasoning_region(None);
 
+    // The reasoning leaves the live stream on close and anchors as a display
+    // message, with the pending partial promoted to a committed line.
+    let _ = sentinel;
+    assert!(
+        app.streaming_text().is_empty(),
+        "reasoning should leave the live stream once anchored: {:?}",
+        app.streaming_text()
+    );
+    let anchored = app
+        .display_messages
+        .iter()
+        .find(|m| m.role == "reasoning")
+        .expect("anchored trace exists");
+    assert!(
+        anchored.content.contains("final thought"),
+        "pending partial promoted into the anchored trace: {:?}",
+        anchored.content
+    );
+}
+
+#[test]
+fn reasoning_preceded_by_answer_keeps_order_and_drops_reasoning() {
+    // Answer text streamed *before* a reasoning block commits ahead of the
+    // anchored trace so the transcript keeps chronological order; answer text
+    // after the close streams below the anchored trace.
+    let mut app = create_test_app();
+    let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
+
+    app.append_streaming_text("Intro before thinking.");
+    app.open_reasoning_region();
+    app.append_reasoning_text("let me think\nstep two\n");
+    app.close_reasoning_region(None);
+    app.append_streaming_text("Conclusion after thinking.");
+
     let text = app.streaming_text();
-    assert_eq!(
-        text.matches(&format!("*{sentinel}final thought{sentinel}*"))
-            .count(),
-        1,
-        "pending partial promoted exactly once on close: {text:?}"
+    assert!(
+        !text.contains(sentinel),
+        "reasoning must leave the live stream: {text:?}"
     );
     assert!(
-        text.ends_with("\n\n"),
-        "region terminated with blank line: {text:?}"
+        text.contains("Conclusion after thinking."),
+        "post-close answer streams live: {text:?}"
     );
+    // Intro committed ahead of the anchored trace, in order.
+    let intro_idx = app
+        .display_messages
+        .iter()
+        .position(|m| m.role == "assistant" && m.content.contains("Intro before thinking."))
+        .expect("intro committed before the anchored trace");
+    let trace_idx = app
+        .display_messages
+        .iter()
+        .position(|m| m.role == "reasoning")
+        .expect("trace anchored in the transcript");
+    assert!(
+        intro_idx < trace_idx,
+        "intro must precede the anchored trace: {intro_idx} vs {trace_idx}"
+    );
+}
+
+#[test]
+fn multiple_reasoning_blocks_anchor_in_order_and_clear_next_prompt() {
+    // Each closed block anchors in the transcript flow, in order, and stays
+    // readable for the whole turn. The next user prompt clears them all.
+    let mut app = create_test_app();
+
+    app.open_reasoning_region();
+    app.append_reasoning_text("first block thinking\n");
+    app.close_reasoning_region(None);
+    app.append_streaming_text("Answer one.");
+    app.commit_pending_streaming_assistant_message();
+
+    app.open_reasoning_region();
+    app.append_reasoning_text("second block thinking\n");
+    app.close_reasoning_region(None);
+
+    let reasoning_msgs: Vec<usize> = app
+        .display_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "reasoning")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        reasoning_msgs.len(),
+        2,
+        "both traces anchor for the duration of the turn"
+    );
+    assert!(
+        !app.streaming_text()
+            .contains(jcode_tui_markdown::REASONING_SENTINEL),
+        "no reasoning markup should linger in the stream: {:?}",
+        app.streaming_text()
+    );
+
+    // The next prompt removes the turn's traces (ephemeral across turns).
+    app.clear_turn_reasoning_traces();
+    assert_eq!(
+        app.display_messages
+            .iter()
+            .filter(|m| m.role == "reasoning")
+            .count(),
+        0,
+        "next prompt clears the turn's anchored traces"
+    );
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|m| m.content.contains("Answer one.")),
+        "committed answers survive trace cleanup"
+    );
+}
+
+#[test]
+fn anchored_trace_never_moves_and_clears_on_next_prompt() {
+    // Anchored traces are ordinary transcript entries: they keep their index
+    // as later content is appended (no bottom-following, no hoisting) and are
+    // removed when the next user prompt begins.
+    let mut app = create_test_app();
+
+    app.open_reasoning_region();
+    app.append_reasoning_text("first trace\n");
+    app.close_reasoning_region(None);
+
+    let trace_idx = app
+        .display_messages
+        .iter()
+        .position(|m| m.role == "reasoning")
+        .expect("first trace anchored");
+
+    // Later activity appends below; the trace index is unchanged.
+    app.append_streaming_text("answer text");
+    app.commit_pending_streaming_assistant_message();
+    app.open_reasoning_region();
+    app.append_reasoning_text("second trace\n");
+    app.close_reasoning_region(None);
+
+    assert_eq!(
+        app.display_messages[trace_idx].role, "reasoning",
+        "anchored trace must keep its transcript position"
+    );
+    assert!(
+        app.display_messages[trace_idx]
+            .content
+            .contains("first trace"),
+        "anchored trace content unchanged"
+    );
+
+    // Next prompt clears all of the turn's traces.
+    app.clear_turn_reasoning_traces();
+    assert_eq!(
+        app.display_messages
+            .iter()
+            .filter(|m| m.role == "reasoning")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn remote_reasoning_delta_burst_is_paced_not_dumped() {
+    // A large provider reasoning burst must reveal over multiple paced frames
+    // (via the segment-aware StreamBuffer), not pop in all at once. This is the
+    // regression test for "reasoning mode feels choppy".
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    let burst = "x".repeat(400);
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ReasoningDelta { text: burst },
+        &mut remote,
+    );
+
+    // Only a small paced slice should be visible immediately; the rest stays
+    // buffered and drains on subsequent redraw frames.
+    let visible = app.streaming_text().matches('x').count();
+    assert!(
+        visible < 400,
+        "reasoning burst must not dump in one frame, revealed {visible} chars"
+    );
+    assert!(
+        !app.stream_buffer.is_empty(),
+        "remainder must stay buffered for paced reveal"
+    );
+
+    // Draining the buffer (as the redraw tick does) eventually reveals it all.
+    let ops = app.stream_buffer.flush();
+    app.apply_stream_ops(ops);
+    assert_eq!(app.streaming_text().matches('x').count(), 400);
+}
+
+#[test]
+fn remote_reasoning_then_text_preserves_order_through_paced_buffer() {
+    // Interleaved reasoning -> answer must reveal in arrival order even though
+    // both kinds now share one paced backlog: the reasoning region closes after
+    // the last buffered reasoning char and before the first answer char.
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.is_processing = true;
+    app.status = ProcessingStatus::Streaming;
+
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ReasoningDelta {
+            text: "thinking hard about this problem\n".to_string(),
+        },
+        &mut remote,
+    );
+    app.handle_server_event(
+        crate::protocol::ServerEvent::ReasoningDone {
+            duration_secs: None,
+        },
+        &mut remote,
+    );
+    app.handle_server_event(
+        crate::protocol::ServerEvent::TextDelta {
+            text: "The answer is 42.".to_string(),
+        },
+        &mut remote,
+    );
+
+    // Drain whatever is still paced.
+    let ops = app.stream_buffer.flush();
+    app.apply_stream_ops(ops);
+
+    // The reasoning region must be closed (current mode discards/retains it) and
+    // the answer text must be present, unstyled, after it.
+    assert!(!app.reasoning_streaming, "region must close before answer");
+    let text = app.streaming_text();
+    assert!(
+        text.contains("The answer is 42."),
+        "answer must reveal after reasoning: {text:?}"
+    );
+}
+
+#[test]
+fn anchored_trace_survives_tool_commit_and_answer_commit() {
+    // Anchored traces are independent transcript entries: neither a tool-only
+    // commit nor an answer commit touches them, so the thought stays readable
+    // (and stationary) for the rest of the turn.
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    app.open_reasoning_region();
+    app.append_reasoning_text("pre-tool thinking\n");
+    app.close_reasoning_region(None);
+    assert_eq!(trace_count(&app), 1);
+
+    // Tool-only commit (no streamed answer text).
+    app.commit_pending_streaming_assistant_message();
+    assert_eq!(trace_count(&app), 1, "tool commit leaves the trace anchored");
+
+    // Answer commit.
+    app.append_streaming_text("the final answer");
+    app.commit_pending_streaming_assistant_message();
+    assert_eq!(
+        trace_count(&app),
+        1,
+        "answer commit leaves the trace anchored"
+    );
+    assert!(
+        !app
+            .display_messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.contains("thought")),
+        "no thought-summary residue may be committed"
+    );
+}
+
+fn trace_count(app: &App) -> usize {
+    app.display_messages
+        .iter()
+        .filter(|m| m.role == "reasoning")
+        .count()
+}
+
+#[test]
+fn gc_dissolves_stale_traces_only_when_provably_offscreen() {
+    // Stale traces (all but the most recent) are GC'd only once the transcript
+    // has grown a full viewport past their anchor point, so removal can never
+    // cause visible motion while tail-following.
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    // Two traces: the first anchored when the transcript was 10 lines tall.
+    crate::tui::ui::set_last_total_wrapped_lines(10);
+    app.open_reasoning_region();
+    app.append_reasoning_text("old thought\n");
+    app.close_reasoning_region(None);
+
+    crate::tui::ui::set_last_total_wrapped_lines(40);
+    app.open_reasoning_region();
+    app.append_reasoning_text("current thought\n");
+    app.close_reasoning_region(None);
+
+    let viewport_h = 20u16;
+    crate::tui::ui::record_layout_snapshot(
+        ratatui::layout::Rect::new(0, 0, 80, viewport_h),
+        None,
+        None,
+        None,
+    );
+
+    // Transcript hasn't grown enough yet: 25 - 10 = 15 <= 20 + 2 margin.
+    crate::tui::ui::set_last_total_wrapped_lines(25);
+    assert!(!app.gc_offscreen_reasoning_traces());
+    assert_eq!(trace_count(&app), 2, "no GC while possibly on screen");
+
+    // Transcript grew a viewport past the first anchor: 40 - 10 = 30 > 22.
+    crate::tui::ui::set_last_total_wrapped_lines(40);
+    assert!(app.gc_offscreen_reasoning_traces());
+    assert_eq!(trace_count(&app), 1, "stale off-screen trace dissolved");
+    assert!(
+        app.display_messages
+            .iter()
+            .any(|m| m.role == "reasoning" && m.content.contains("current thought")),
+        "the most recent trace always survives"
+    );
+}
+
+#[test]
+fn gc_never_runs_while_user_scrolled_up() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    crate::tui::ui::set_last_total_wrapped_lines(10);
+    app.open_reasoning_region();
+    app.append_reasoning_text("old thought\n");
+    app.close_reasoning_region(None);
+    app.open_reasoning_region();
+    app.append_reasoning_text("current thought\n");
+    app.close_reasoning_region(None);
+
+    crate::tui::ui::record_layout_snapshot(
+        ratatui::layout::Rect::new(0, 0, 80, 20),
+        None,
+        None,
+        None,
+    );
+    crate::tui::ui::set_last_total_wrapped_lines(200);
+
+    // Scrolled up: the user may be reading the old trace; never remove it.
+    app.auto_scroll_paused = true;
+    assert!(!app.gc_offscreen_reasoning_traces());
+    assert_eq!(trace_count(&app), 2);
+
+    // Back at the tail: GC may proceed.
+    app.auto_scroll_paused = false;
+    assert!(app.gc_offscreen_reasoning_traces());
+    assert_eq!(trace_count(&app), 1);
+}
+
+#[test]
+fn gc_keeps_single_trace_indefinitely() {
+    // With only one (current) trace there is nothing stale to collect, no
+    // matter how much the transcript grows.
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    crate::tui::ui::set_last_total_wrapped_lines(10);
+    app.open_reasoning_region();
+    app.append_reasoning_text("only thought\n");
+    app.close_reasoning_region(None);
+
+    crate::tui::ui::record_layout_snapshot(
+        ratatui::layout::Rect::new(0, 0, 80, 20),
+        None,
+        None,
+        None,
+    );
+    crate::tui::ui::set_last_total_wrapped_lines(500);
+    assert!(!app.gc_offscreen_reasoning_traces());
+    assert_eq!(trace_count(&app), 1, "the current thought is never GC'd");
 }
